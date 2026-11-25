@@ -28,9 +28,9 @@ export class CharacterTools {
    */
   private async getGameSystem(): Promise<GameSystem> {
     // Don't cache 'other' — it likely means Foundry wasn't connected yet.
-    if (!this.cachedGameSystem || this.cachedGameSystem === 'other') {
-      this.cachedGameSystem = await detectGameSystem(this.foundryClient, this.logger);
-    }
+    // detectGameSystem keeps its own cache, cleared whenever Foundry reconnects
+    // (the GM may have opened a world that uses a different system).
+    this.cachedGameSystem = await detectGameSystem(this.foundryClient, this.logger);
     return this.cachedGameSystem;
   }
 
@@ -111,7 +111,7 @@ export class CharacterTools {
       {
         name: 'use-item',
         description:
-          'Use an item on a character (cast spell, use ability, activate feature, consume item). Opens the item dialog in Foundry VTT for the GM to configure options and confirm. Optionally specify targets by name. Returns immediately with status "initiated" - tell the user to check Foundry for any dialogs. Works across systems: D&D 5e, PF2e, DSA5. Use get-character or search-character-items first to see available items/spells.',
+          'Use an item on a character (cast spell, use ability, activate feature, consume item). Opens the item dialog in Foundry VTT for the GM to configure options and confirm. Optionally specify targets by name. Returns immediately with status "initiated" - tell the user to check Foundry for any dialogs. Stars/Worlds Without Number weapons and skills are different: they roll at once with no dialog and return status "rolled" with the result, so the choices the dialog would have offered are parameters here (modifier, burst, attackMode, attribute). Before rolling one of those, ask the GM for any of these they have not already settled, in one short question; if the result says a choice is needed, ask and call again. Works across systems: D&D 5e, PF2e, DSA5. Use get-character or search-character-items first to see available items/spells.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -136,6 +136,27 @@ export class CharacterTools {
             spellLevel: {
               type: 'number',
               description: 'For spells: cast at a higher level than base (D&D 5e upcasting)',
+            },
+            modifier: {
+              type: 'number',
+              description:
+                'SWN/WWN weapons and skills: situational modifier added to the attack or skill roll (e.g. 2 or -2). ASK the GM for this before rolling unless they already gave one or said there is none; pass 0 for none.',
+            },
+            burst: {
+              type: 'boolean',
+              description:
+                'SWN weapons that can burst fire: fire a burst (+2 to hit and damage, uses 3 rounds). ASK the GM when the weapon supports it and they have not said.',
+            },
+            attackMode: {
+              type: 'string',
+              enum: ['melee', 'missile'],
+              description:
+                'WWN weapons usable both in melee and thrown/shot: which way this attack is made. ASK the GM when the weapon supports both and they have not said.',
+            },
+            attribute: {
+              type: 'string',
+              description:
+                'SWN/WWN skills: attribute to roll the skill with (str, dex, con, int, wis, cha) instead of the skill default. Required when the skill has no default ("ask"); ASK the GM in that case.',
             },
           },
           required: ['actorIdentifier', 'itemIdentifier'],
@@ -454,10 +475,24 @@ export class CharacterTools {
       consume: z.boolean().optional(),
       spellLevel: z.number().optional(),
       skipDialog: z.boolean().optional(),
+      modifier: z.number().optional(),
+      burst: z.boolean().optional(),
+      attackMode: z.enum(['melee', 'missile']).optional(),
+      attribute: z.string().optional(),
     });
 
-    const { actorIdentifier, itemIdentifier, targets, consume, spellLevel, skipDialog } =
-      schema.parse(args);
+    const {
+      actorIdentifier,
+      itemIdentifier,
+      targets,
+      consume,
+      spellLevel,
+      skipDialog,
+      modifier,
+      burst,
+      attackMode,
+      attribute,
+    } = schema.parse(args);
 
     this.logger.info('Using item', {
       actorIdentifier,
@@ -477,6 +512,10 @@ export class CharacterTools {
           consume: consume ?? true,
           spellLevel,
           skipDialog: skipDialog ?? true, // Default to skipping dialogs for MCP automation
+          modifier,
+          burst,
+          attackMode,
+          attribute,
         },
       });
 

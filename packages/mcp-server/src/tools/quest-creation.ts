@@ -394,8 +394,8 @@ export class QuestCreationTools {
 
       const request = requestSchema.parse(args);
 
-      // Auto-convert Markdown to plain text with warning (don't block)
-      request.newContent = this.convertMarkdownToPlainText(request.newContent);
+      // Models usually write Markdown; store it as the HTML Foundry journals use.
+      request.newContent = this.markdownToHtml(request.newContent);
 
       // If both pageId and newPageName are given, rename AND update that existing
       // page in place -- must be checked before the newPageName-only branch below,
@@ -579,8 +579,8 @@ export class QuestCreationTools {
 
       const request = requestSchema.parse(args);
 
-      // Auto-convert Markdown to plain text with warning (don't block)
-      request.newContent = this.convertMarkdownToPlainText(request.newContent);
+      // Models usually write Markdown; store it as the HTML Foundry journals use.
+      request.newContent = this.markdownToHtml(request.newContent);
 
       // Format the replacement content for Foundry
       const replacementContent = this.formatUpdateContentForFoundry(request.newContent);
@@ -1481,30 +1481,67 @@ export class QuestCreationTools {
   }
 
   /**
-   * Convert Markdown to plain text and warn (don't block the operation)
-   * This ensures the tool works while gently educating about proper format
+   * Convert Markdown to the HTML that Foundry journal pages store. Content that
+   * already contains HTML tags is returned untouched.
    */
-  private convertMarkdownToPlainText(content: string): string {
-    const originalContent = content;
+  private markdownToHtml(content: string): string {
+    if (/<[a-z][^>]*>/i.test(content)) return content;
 
-    // Convert common Markdown patterns to plain text
-    content = content
-      .replace(/\*\*(.+?)\*\*/g, '$1') // **bold** → bold
-      .replace(/\*(.+?)\*/g, '$1') // *italic* → italic
-      .replace(/^#{1,6}\s+(.+)/gm, '$1') // # headers → headers
-      .replace(/`(.+?)`/g, '$1') // `code` → code
-      .replace(/\[(.+?)\]\((.+?)\)/g, '$1') // [text](url) → text
-      .replace(/^[-*+]\s+(.+)/gm, '$1') // - item → item
-      .replace(/^\d+\.\s+(.+)/gm, '$1') // 1. item → item
-      .replace(/^>\s*(.+)/gm, '$1'); // > quote → quote
+    const inline = (text: string): string =>
+      text
+        .replace(/`([^`]+)`/g, '<code>$1</code>')
+        .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+        .replace(/__(.+?)__/g, '<strong>$1</strong>')
+        .replace(/(^|[^*])\*([^*\s][^*]*?)\*/g, '$1<em>$2</em>')
+        .replace(/(^|[\s(])_([^_\s][^_]*?)_(?=[\s).,;:!?]|$)/g, '$1<em>$2</em>')
+        .replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, '<img src="$2" alt="$1">')
+        .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, '<a href="$2">$1</a>');
 
-    // If we made changes, log a warning (but don't block)
-    if (content !== originalContent) {
-      this.logger.warn(
-        'Automatically converted Markdown formatting to plain text. Future updates will work better with plain text input.'
-      );
+    const out: string[] = [];
+    let paragraph: string[] = [];
+    let list: 'ul' | 'ol' | null = null;
+    let quote: string[] = [];
+    const flush = (): void => {
+      if (paragraph.length) out.push(`<p>${paragraph.map(inline).join('<br>')}</p>`);
+      if (list) out.push(`</${list}>`);
+      if (quote.length)
+        out.push(`<blockquote><p>${quote.map(inline).join('<br>')}</p></blockquote>`);
+      paragraph = [];
+      list = null;
+      quote = [];
+    };
+
+    for (const raw of content.replace(/\r\n?/g, '\n').split('\n')) {
+      const line = raw.trimEnd();
+      const heading = /^(#{1,6})\s+(.+?)\s*#*$/.exec(line);
+      const bullet = /^\s*[-*+]\s+(.+)$/.exec(line);
+      const numbered = /^\s*\d+[.)]\s+(.+)$/.exec(line);
+      const quoted = /^>\s?(.*)$/.exec(line);
+      if (!line.trim()) {
+        flush();
+      } else if (heading) {
+        flush();
+        out.push(`<h${heading[1]!.length}>${inline(heading[2]!)}</h${heading[1]!.length}>`);
+      } else if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(line)) {
+        flush();
+        out.push('<hr>');
+      } else if (bullet || numbered) {
+        const kind = bullet ? 'ul' : 'ol';
+        if (list !== kind) {
+          flush();
+          out.push(`<${kind}>`);
+          list = kind;
+        }
+        out.push(`<li>${inline((bullet ?? numbered)![1]!)}</li>`);
+      } else if (quoted) {
+        if (paragraph.length || list) flush();
+        quote.push(quoted[1]!);
+      } else {
+        if (list || quote.length) flush();
+        paragraph.push(line.trim());
+      }
     }
-
-    return content;
+    flush();
+    return out.join('');
   }
 }

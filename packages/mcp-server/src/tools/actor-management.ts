@@ -307,7 +307,7 @@ export class ActorManagementTools {
     const adapter = await this.getAdapter();
     const normalizedActors = adapter?.normalizePayload
       ? actors.map(a =>
-          a.system !== undefined ? { ...a, system: adapter.normalizePayload!(a.system) } : a
+          a.system !== undefined ? { ...a, system: adapter.normalizePayload!(a.system, a.type) } : a
         )
       : actors;
 

@@ -19,12 +19,34 @@ export class ChatTools {
   getToolDefinitions() {
     return [
       {
+        name: 'list-chat-messages',
+        description:
+          'Read recent messages from the Foundry chat log, oldest first: who spoke, the text, ' +
+          'whisper recipients, and dice results (formula, total, each die). Use this after ' +
+          'request-player-rolls to see what the player rolled, or to catch up on table chat.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            limit: {
+              type: 'number',
+              description: 'How many of the latest messages (default 20, max 100)',
+            },
+            rollsOnly: { type: 'boolean', description: 'Only messages that contain dice rolls' },
+            speaker: {
+              type: 'string',
+              description: 'Only messages whose speaker or author name contains this text',
+            },
+          },
+        },
+      },
+      {
         name: 'create-chat-message',
         description:
           'Speak an in-character line as an actor or a specific token: a floating speech ' +
           'bubble over the token (the default), a real chat-log message, or a whisper to ' +
           'named players. Pass a language to have Polyglot scramble a chat-log message for ' +
-          "viewers who don't know it. One call posts one line. Requires Allow Write " +
+          "viewers who don't know it. With no actor or token and chatLog: true, the line is " +
+          'posted to the chat log as the Gamemaster (narration). One call posts one line. Requires Allow Write ' +
           'Operations in the bridge module settings.',
         inputSchema: {
           type: 'object',
@@ -81,6 +103,23 @@ export class ChatTools {
     ];
   }
 
+  async handleListChatMessages(args: any): Promise<any> {
+    const parsed = z
+      .object({
+        limit: z.number().int().min(1).max(100).optional(),
+        rollsOnly: z.boolean().optional(),
+        speaker: z.string().optional(),
+      })
+      .parse(args ?? {});
+    try {
+      return await this.foundryClient.query('foundry-mcp-bridge.listChatMessages', parsed);
+    } catch (error) {
+      throw new Error(
+        `Failed to list chat messages: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
+  }
+
   async handleCreateChatMessage(args: any): Promise<any> {
     const schema = z
       .object({
@@ -91,8 +130,9 @@ export class ChatTools {
         chatLog: z.boolean().optional(),
         whisperTo: z.array(z.string()).optional(),
       })
-      .refine(v => v.actorIdentifier || v.tokenId, {
-        message: 'Either actorIdentifier or tokenId is required',
+      .refine(v => v.actorIdentifier || v.tokenId || v.chatLog || v.whisperTo?.length, {
+        message:
+          'Either actorIdentifier or tokenId is required for a speech bubble. Pass chatLog: true to post to the chat log as the Gamemaster (narration).',
       });
 
     const parsed = schema.parse(args);

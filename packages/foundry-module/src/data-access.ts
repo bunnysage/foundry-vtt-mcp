@@ -245,6 +245,7 @@ interface SceneInfo {
   width: number;
   height: number;
   padding: number;
+  gridSize?: number;
   active: boolean;
   navigation: boolean;
   tokens: SceneToken[];
@@ -395,7 +396,8 @@ interface ItemTargetingResult {
  */
 class PersistentCreatureIndex {
   private moduleId: string = MODULE_ID;
-  private readonly INDEX_VERSION = '1.0.0';
+  // Bumped when the indexed fields change, so stale saved indexes are rebuilt.
+  private readonly INDEX_VERSION = '1.1.0';
   private readonly INDEX_FILENAME = 'enhanced-creature-index.json';
   private buildInProgress = false;
   private hooksRegistered = false;
@@ -1577,7 +1579,8 @@ class PersistentCreatureIndex {
   // ─── SWNR index builder ─────────────────────────────────────────────────────
 
   private calcSWNRMod(value: number): number {
-    return Math.floor((value - 10) / 2);
+    // Without Number table: 3 = -2, 4-7 = -1, 8-13 = 0, 14-17 = +1, 18 = +2.
+    return value <= 3 ? -2 : value <= 7 ? -1 : value <= 13 ? 0 : value <= 17 ? 1 : 2;
   }
 
   private async buildSWNRIndex(_force = false): Promise<SWNRCreatureIndex[]> {
@@ -1668,7 +1671,10 @@ class PersistentCreatureIndex {
           const attrMap: Record<string, { value: number; mod: number }> = {};
 
           for (const [k, v] of Object.entries(stats)) {
-            const val = typeof v === 'object' ? ((v as any).value ?? 10) : (v as number);
+            const val =
+              typeof v === 'object'
+                ? ((v as any).total ?? (v as any).value ?? (v as any).base ?? 10)
+                : (v as number);
             const mod =
               typeof v === 'object' && (v as any).mod !== undefined
                 ? (v as any).mod
@@ -1726,7 +1732,8 @@ class PersistentCreatureIndex {
   // ─── WWN index builder ──────────────────────────────────────────────────────
 
   private calcWWNMod(value: number): number {
-    return Math.floor((value - 10) / 2);
+    // Without Number table: 3 = -2, 4-7 = -1, 8-13 = 0, 14-17 = +1, 18 = +2.
+    return value <= 3 ? -2 : value <= 7 ? -1 : value <= 13 ? 0 : value <= 17 ? 1 : 2;
   }
 
   private async buildWWNIndex(_force = false): Promise<WWNCreatureIndex[]> {
@@ -1813,7 +1820,7 @@ class PersistentCreatureIndex {
 
         try {
           const system = (doc as any).system ?? {};
-          const stats = system.stats ?? {};
+          const stats = system.scores ?? system.stats ?? {};
           const attrMap: Record<string, { value: number; mod: number }> = {};
 
           for (const [k, v] of Object.entries(stats)) {
@@ -1825,20 +1832,26 @@ class PersistentCreatureIndex {
             attrMap[k.toUpperCase()] = { value: val, mod };
           }
 
-          const hitPoints = system.health?.max ?? system.health?.value ?? undefined;
-          const armorClass = typeof system.ac === 'object' ? system.ac.value : system.ac;
-          const hitDice = system.hitDice ?? system.hd ?? undefined;
+          // The wwn system keeps hit points and hit dice in system.hp, and
+          // ascending armor class in system.aac.
+          const hpData = system.hp ?? system.health ?? {};
+          const hitPoints = hpData.max ?? hpData.value ?? undefined;
+          const aac = typeof system.aac === 'object' ? system.aac?.value : system.aac;
+          const armorClass = aac ?? (typeof system.ac === 'object' ? system.ac.value : system.ac);
+          const hitDice = hpData.hd ?? system.hitDice ?? system.hd ?? undefined;
 
           // Check for magic items
           const items: any[] = Array.isArray((doc as any).items) ? (doc as any).items : [];
-          const hasMagic = items.some(
-            (item: any) =>
-              item.type === 'spell' ||
-              item.type === 'art' ||
-              item.type === 'gift' ||
-              (item.type === 'skill' &&
-                ['cast', 'magic', 'pray'].includes(item.name?.toLowerCase()))
-          );
+          const hasMagic =
+            system.spells?.enabled === true ||
+            items.some(
+              (item: any) =>
+                item.type === 'spell' ||
+                item.type === 'art' ||
+                item.type === 'gift' ||
+                (item.type === 'skill' &&
+                  ['cast', 'magic', 'pray'].includes(item.name?.toLowerCase()))
+            );
 
           const tags: string[] = system.tags || [];
 
@@ -3389,7 +3402,57 @@ export class FoundryDataAccess {
       return a.name.localeCompare(b.name);
     });
 
-    return results.slice(0, 50); // Final limit
+    const limited = results.slice(0, 50); // Final limit
+    await this.attachCreatureStats(limited);
+    return limited;
+  }
+
+  /**
+   * Add the key combat numbers to actor results of a name search, taken from the
+   * saved creature index, so a caller does not need one more request per creature.
+   * Best effort: a missing or disabled index leaves the results as they were.
+   */
+  private async attachCreatureStats(results: any[]): Promise<void> {
+    try {
+      if (!results.length) return;
+      if (!game.settings.get(this.moduleId, 'enableEnhancedCreatureIndex')) return;
+      const actorPacks = new Set(
+        Array.from(game.packs.values())
+          .filter((p: any) => p.metadata.type === 'Actor')
+          .map((p: any) => p.metadata.id)
+      );
+      if (!results.some(r => actorPacks.has(r.pack))) return;
+
+      const byKey = new Map<string, any>();
+      for (const c of await this.persistentIndex.getEnhancedIndex()) {
+        byKey.set(`${(c as any).pack}|${c.id}`, c);
+      }
+      const fields = [
+        'hitDice',
+        'hitPoints',
+        'armorClass',
+        'challengeRating',
+        'level',
+        'tier',
+        'hits',
+        'creatureType',
+        'hasPsionics',
+        'hasMagic',
+        'hasSpells',
+      ];
+      for (const r of results) {
+        const c = byKey.get(`${r.pack}|${r.id}`);
+        if (!c) continue;
+        const stats: Record<string, any> = {};
+        for (const f of fields) {
+          const v = c[f];
+          if (v !== undefined && v !== null && v !== '' && v !== false) stats[f] = v;
+        }
+        if (Object.keys(stats).length) r.stats = stats;
+      }
+    } catch (error) {
+      console.warn(`[${this.moduleId}] Could not attach creature stats to search results:`, error);
+    }
   }
 
   /**
@@ -3816,10 +3879,11 @@ export class FoundryDataAccess {
    * SWNR criteria filter — hitDice range, hitPoints range, armorClass range, hasPsionics, tags.
    */
   private passesSWNRCriteria(creature: SWNRCreatureIndex, criteria: any): boolean {
-    // Hit Dice range
+    if (criteria.actorType && creature.type !== criteria.actorType) return false;
+    // Hit Dice range. Stored as text ("6", "10d8"); compare on the leading number.
     if (criteria.hitDice) {
-      const hd = creature.hitDice;
-      if (hd === undefined) return false;
+      const hd = parseInt(String(creature.hitDice ?? ''), 10);
+      if (Number.isNaN(hd)) return false;
       if (criteria.hitDice.min !== undefined && hd < criteria.hitDice.min) return false;
       if (criteria.hitDice.max !== undefined && hd > criteria.hitDice.max) return false;
     }
@@ -3860,10 +3924,11 @@ export class FoundryDataAccess {
    * WWN criteria filter — hitDice range, hitPoints range, armorClass range, hasMagic, tags.
    */
   private passesWWNCriteria(creature: WWNCreatureIndex, criteria: any): boolean {
-    // Hit Dice range
+    if (criteria.actorType && creature.type !== criteria.actorType) return false;
+    // Hit Dice range. May be stored as text ("6", "10d8"); compare on the leading number.
     if (criteria.hitDice) {
-      const hd = creature.hitDice;
-      if (hd === undefined) return false;
+      const hd = parseInt(String(creature.hitDice ?? ''), 10);
+      if (Number.isNaN(hd)) return false;
       if (criteria.hitDice.min !== undefined && hd < criteria.hitDice.min) return false;
       if (criteria.hitDice.max !== undefined && hd > criteria.hitDice.max) return false;
     }
@@ -4339,8 +4404,21 @@ export class FoundryDataAccess {
     }));
   }
 
+  /** Which scene the Gamemaster is viewing versus the one that is active for players. */
+  private describeViewedScene(scene: any): Record<string, any> {
+    const active = (game.scenes as any)?.active ?? game.scenes?.find((s: any) => s.active);
+    if (!active || active.id === scene.id) return { viewedByGM: true };
+    return {
+      viewedByGM: true,
+      activeScene: { id: active.id, name: active.name },
+      note:
+        `The Gamemaster is viewing "${scene.name}", but players are on the active scene ` +
+        `"${active.name}". Token tools act on the viewed scene. Use switch-scene to change it.`,
+    };
+  }
+
   /**
-   * Get active scene information
+   * Get the scene the Gamemaster is viewing (usually also the active scene)
    */
   async getActiveScene(): Promise<SceneInfo> {
     const scene = (game.scenes as any).current;
@@ -4361,7 +4439,11 @@ export class FoundryDataAccess {
       width: scene.width,
       height: scene.height,
       padding: scene.padding,
+      gridSize: (scene as any).grid?.size,
       active: scene.active,
+      // "Current" is the scene this Gamemaster is looking at, which is where the
+      // token tools act. Players are on the active scene; say so when they differ.
+      ...this.describeViewedScene(scene),
       navigation: scene.navigation,
       tokens: scene.tokens.map((token: any) => ({
         id: token.id,
@@ -5169,7 +5251,14 @@ export class FoundryDataAccess {
 
       // Validate actor type - support all common actor types including DSA5 creatures
       // and Cosmere RPG adversaries.
-      const validActorTypes = ['character', 'npc', 'creature', 'adversary'];
+      // Accept whatever actor types the active system defines (WWN uses 'monster'),
+      // plus the common names used by the systems this bridge already supports.
+      const systemActorTypes: string[] = Object.keys(
+        ((game as any).system?.documentTypes?.Actor as Record<string, unknown>) ?? {}
+      );
+      const validActorTypes = [
+        ...new Set(['character', 'npc', 'creature', 'adversary', ...systemActorTypes]),
+      ];
       if (!validActorTypes.includes(sourceDocument.type)) {
         throw new Error(
           `Document "${itemId}" has unsupported actor type: ${sourceDocument.type}. Supported types: ${validActorTypes.join(', ')}`
@@ -5202,6 +5291,11 @@ export class FoundryDataAccess {
             folder: null, // Don't inherit folder
             prototypeToken: sourceData.prototypeToken, // Include prototype token
           };
+
+          // A renamed actor's tokens should carry the new name, not the compendium entry's.
+          if (actorData.prototypeToken && customName && customName !== sourceData.name) {
+            actorData.prototypeToken = { ...actorData.prototypeToken, name: customName };
+          }
 
           // Fix remote image URLs - normalize to local paths
           if (actorData.prototypeToken?.texture?.src?.startsWith('http')) {
@@ -6220,12 +6314,28 @@ export class FoundryDataAccess {
           }
 
           const tokenDoc = (actor as any).prototypeToken.toObject();
-          const position = this.calculateTokenPosition(
+          let position = this.calculateTokenPosition(
             placement.placement,
             scene,
             tokenData.length,
             placement.coordinates
           );
+          // Do not stack a new token on one that is already there (earlier calls
+          // start from the same spot). Explicit coordinates are taken as given.
+          if (placement.placement !== 'coordinates') {
+            const grid = scene.grid?.size || 100;
+            const taken = (x: number, y: number): boolean =>
+              [...scene.tokens.map((t: any) => ({ x: t.x, y: t.y })), ...tokenData].some(
+                (t: any) => Math.abs(t.x - x) < grid && Math.abs(t.y - y) < grid
+              );
+            for (let step = 0; step < 200 && taken(position.x, position.y); step++) {
+              const nextX = position.x + grid;
+              position =
+                nextX + grid <= (scene.width || nextX + grid)
+                  ? { x: nextX, y: position.y }
+                  : { x: grid, y: position.y + grid };
+            }
+          }
 
           // Fix token texture if it's still a remote URL (Foundry may have overridden our actor creation fix)
           if (tokenDoc.texture?.src?.startsWith('http')) {
@@ -6471,7 +6581,13 @@ export class FoundryDataAccess {
 
       // Generate roll button HTML
       const buttonId = foundry.utils.randomID();
-      const buttonLabel = this.buildRollButtonLabel(data.rollType, data.rollTarget, data.isPublic);
+      let buttonLabel = this.buildRollButtonLabel(data.rollType, data.rollTarget, data.isPublic);
+      // Without Number saves succeed on the target number or higher; show it on the button.
+      const saveTarget =
+        data.rollType === 'save'
+          ? this.withoutNumberSaveTarget(data.rollTarget, playerInfo.character)
+          : undefined;
+      if (saveTarget !== undefined) buttonLabel += ` — needs ${saveTarget}+`;
 
       // Check if this type of roll was already performed (optional: could check for duplicate recent rolls)
       // For now, we'll just create the button and let the rendering logic handle the state restoration
@@ -6484,7 +6600,8 @@ export class FoundryDataAccess {
           
           <div style="text-align: center; margin-top: 8px;">
             <!-- Single Roll Button (clickable by both character owner and GM) -->
-            <button class="mcp-roll-button mcp-button-active" 
+            <button class="mcp-roll-button mcp-button-active"
+                    style="height: auto; min-height: 2rem; white-space: normal; line-height: 1.3; padding: 6px 10px;"
                     data-button-id="${buttonId}"
                     data-roll-formula="${rollFormula}"
                     data-roll-label="${buttonLabel}"
@@ -6555,7 +6672,10 @@ export class FoundryDataAccess {
       return {
         success: true,
         message: `Roll request sent to ${playerInfo.targetName}. ${data.isPublic ? 'Public roll' : 'Private roll'} button created in chat.`,
-      };
+        formula: rollFormula,
+        ...(playerInfo.character ? { character: playerInfo.character.name } : {}),
+        ...(saveTarget !== undefined ? { saveTarget } : {}),
+      } as any;
     } catch (error) {
       console.error(`[${MODULE_ID}] Error creating roll request:`, error);
       return {
@@ -6748,8 +6868,11 @@ export class FoundryDataAccess {
     character?: Actor
   ): string {
     let baseFormula = '1d20';
+    const systemId = String((game as any).system?.id ?? '');
 
-    if (character) {
+    if (character && (systemId === 'swnr' || systemId === 'wwn')) {
+      baseFormula = this.buildWithoutNumberFormula(systemId, rollType, rollTarget, character);
+    } else if (character) {
       // Use Foundry's getRollData() to get calculated modifiers including active effects
       const rollData = character.getRollData() as any; // Type assertion for Foundry's dynamic roll data
 
@@ -6788,6 +6911,10 @@ export class FoundryDataAccess {
         default:
           baseFormula = '1d20';
       }
+    } else if (rollType === 'custom') {
+      baseFormula = rollTarget;
+    } else if (rollType === 'skill' && (systemId === 'swnr' || systemId === 'wwn')) {
+      baseFormula = '2d6';
     } else {
       console.warn(`[${MODULE_ID}] No character provided for roll formula, using base 1d20`);
     }
@@ -6802,6 +6929,113 @@ export class FoundryDataAccess {
     }
 
     return baseFormula;
+  }
+
+  /** Attribute modifier of a Stars/Worlds Without Number actor ("str", "dexterity", ...). */
+  private withoutNumberMod(systemId: string, character: Actor, attribute: string): number {
+    const key = attribute.toLowerCase().trim().slice(0, 3);
+    const system = (character as any).system ?? {};
+    const mod = (systemId === 'swnr' ? system.stats : system.scores)?.[key]?.mod;
+    return typeof mod === 'number' ? mod : 0;
+  }
+
+  /** The owned skill item matching a name, and its rank (-1 when untrained or missing). */
+  private withoutNumberSkill(
+    systemId: string,
+    character: Actor,
+    name: string
+  ): { rank: number; attribute: string; dice: string } {
+    const wanted = name.toLowerCase().trim();
+    const item = ((character as any).items?.contents ?? []).find(
+      (i: any) => i.type === 'skill' && i.name?.toLowerCase() === wanted
+    );
+    const s = item?.system ?? {};
+    const rank = systemId === 'swnr' ? s.rank : s.ownedLevel;
+    return {
+      rank: typeof rank === 'number' ? rank : -1,
+      attribute: String((systemId === 'swnr' ? s.defaultStat : s.score) || ''),
+      dice: String((systemId === 'swnr' ? s.pool : s.skillDice) || '2d6').replace(/^ask$/i, '2d6'),
+    };
+  }
+
+  /**
+   * Stars / Worlds Without Number rolls. Skill checks are 2d6 + skill level +
+   * attribute modifier; saves are a plain d20 against the character's own save
+   * target; attacks are d20 + attack bonus; initiative is d8 + Dexterity.
+   * A rollTarget such as "notice/wis" names the attribute to use with the skill.
+   */
+  private buildWithoutNumberFormula(
+    systemId: string,
+    rollType: string,
+    rollTarget: string,
+    character: Actor
+  ): string {
+    const system = (character as any).system ?? {};
+    const signed = (n: number): string => (n < 0 ? `${n}` : `+${n}`);
+    switch (rollType) {
+      case 'skill': {
+        const [skillName = '', attribute = ''] = rollTarget.split(/[\/+,]/).map(p => p.trim());
+        const skill = this.withoutNumberSkill(systemId, character, skillName);
+        const mod = this.withoutNumberMod(systemId, character, attribute || skill.attribute);
+        return `${/^\d+d\d+/i.test(skill.dice) ? skill.dice : '2d6'}${signed(skill.rank)}${signed(mod)}`;
+      }
+      case 'ability':
+        return `2d6${signed(this.withoutNumberMod(systemId, character, rollTarget))}`;
+      case 'save':
+        return '1d20';
+      case 'attack': {
+        // d20 + attack bonus, and when rollTarget names a weapon the character
+        // carries: + that weapon's attribute modifier + its combat skill level
+        // (-2 when unskilled) + the weapon's own bonus.
+        const ab = systemId === 'swnr' ? system.ab : system.thac0?.bba;
+        let formula = `1d20${signed(typeof ab === 'number' ? ab : 0)}`;
+        const wanted = rollTarget.toLowerCase().trim();
+        const items: any[] = (character as any).items?.contents ?? [];
+        const weapon = wanted
+          ? items.find(i => i.type === 'weapon' && i.name?.toLowerCase() === wanted)
+          : undefined;
+        if (weapon) {
+          const w = weapon.system ?? {};
+          const attribute = String((systemId === 'swnr' ? w.stat : w.score) || '');
+          if (attribute) formula += signed(this.withoutNumberMod(systemId, character, attribute));
+          const skillRef = String(w.skill || '');
+          if (skillRef) {
+            const skillItem = items.find(
+              i =>
+                i.type === 'skill' &&
+                (i.id === skillRef || i.name?.toLowerCase() === skillRef.toLowerCase())
+            );
+            const rank =
+              systemId === 'swnr' ? skillItem?.system?.rank : skillItem?.system?.ownedLevel;
+            formula += signed(typeof rank === 'number' && rank >= 0 ? rank : -2);
+          }
+          const own = Number(systemId === 'swnr' ? w.ab : w.bonus);
+          if (Number.isFinite(own) && own !== 0) formula += signed(own);
+        }
+        return formula;
+      }
+      case 'initiative':
+        return `1d8${signed(this.withoutNumberMod(systemId, character, 'dex'))}`;
+      case 'custom':
+        return rollTarget;
+      default:
+        return '1d20';
+    }
+  }
+
+  /** For a Without Number save, the number the d20 must reach, when the sheet has one. */
+  private withoutNumberSaveTarget(rollTarget: string, character?: Actor): number | undefined {
+    const systemId = String((game as any).system?.id ?? '');
+    if (!character || (systemId !== 'swnr' && systemId !== 'wwn')) return undefined;
+    const system = (character as any).system ?? {};
+    const key = rollTarget.toLowerCase().trim();
+    const target =
+      systemId === 'swnr'
+        ? typeof system.save === 'object'
+          ? system.save?.[key]
+          : system.saves
+        : system.saves?.[key]?.value;
+    return typeof target === 'number' && target > 0 ? target : undefined;
   }
 
   /**
@@ -6847,8 +7081,12 @@ export class FoundryDataAccess {
     switch (rollType) {
       case 'ability':
         return `${rollTarget.toUpperCase()} Ability Check (${visibility})`;
-      case 'skill':
-        return `${rollTarget.charAt(0).toUpperCase() + rollTarget.slice(1)} Skill Check (${visibility})`;
+      case 'skill': {
+        // "pilot/int" reads as "Pilot (INT)".
+        const [skill = '', attribute = ''] = rollTarget.split(/[\/+,]/).map(p => p.trim());
+        const name = skill.charAt(0).toUpperCase() + skill.slice(1);
+        return `${name}${attribute ? ` (${attribute.toUpperCase()})` : ''} Skill Check (${visibility})`;
+      }
       case 'save':
         return `${rollTarget.toUpperCase()} Saving Throw (${visibility})`;
       case 'attack':
@@ -7000,7 +7238,12 @@ export class FoundryDataAccess {
 
         const messageData: any = {
           speaker: ChatMessage.getSpeaker({ actor: character }),
-          flavor: `${rollLabel} ${isGmRoll ? '(GM Override)' : ''}`,
+          // A label ending "needs 13+" carries the target; say how the roll came out.
+          flavor: `${rollLabel} ${isGmRoll ? '(GM Override)' : ''}${(() => {
+            const need = /needs (\d+)\+/.exec(String(rollLabel));
+            if (!need) return '';
+            return (roll.total ?? 0) >= Number(need[1]) ? ' — Success' : ' — Failure';
+          })()}`,
           ...(whisperTargets.length > 0 ? { whisper: whisperTargets } : {}),
         };
 
@@ -7992,9 +8235,14 @@ export class FoundryDataAccess {
         throw new Error(`Actor not found: ${data.actorIdentifier}`);
       }
       [token] = (actor.getActiveTokens(false, false) as any[]) || [];
-    } else {
-      throw new Error('Either actorIdentifier or tokenId is required');
+    } else if (!data.chatLog && !data.whisperTo?.length) {
+      throw new Error(
+        'Either actorIdentifier or tokenId is required for a speech bubble. ' +
+          'Pass chatLog: true to post to the chat log as the Gamemaster instead.'
+      );
     }
+    // With no speaker and chatLog (or a whisper), the message is posted as the GM: narration.
+    const narration = !actor && !token;
 
     // Two shapes of the same token are needed below and they are not interchangeable:
     // bubbles.broadcast() wants the placeable, while ChatMessage.getSpeaker() must get the
@@ -8048,13 +8296,19 @@ export class FoundryDataAccess {
       };
     }
 
-    const messageData: Record<string, any> = {
-      content,
-      speaker: tokenDoc
-        ? ChatMessage.getSpeaker({ token: tokenDoc, actor })
-        : ChatMessage.getSpeaker({ actor }),
-      style: (CONST as any).CHAT_MESSAGE_STYLES?.IC ?? (CONST as any).CHAT_MESSAGE_TYPES?.IC,
-    };
+    const messageData: Record<string, any> = narration
+      ? {
+          content,
+          speaker: { alias: (game.user as any)?.name ?? 'Gamemaster' },
+          style: (CONST as any).CHAT_MESSAGE_STYLES?.OOC ?? (CONST as any).CHAT_MESSAGE_TYPES?.OOC,
+        }
+      : {
+          content,
+          speaker: tokenDoc
+            ? ChatMessage.getSpeaker({ token: tokenDoc, actor })
+            : ChatMessage.getSpeaker({ actor }),
+          style: (CONST as any).CHAT_MESSAGE_STYLES?.IC ?? (CONST as any).CHAT_MESSAGE_TYPES?.IC,
+        };
 
     if (applyPolyglot) {
       messageData.flags = { polyglot: { language: data.language } };
@@ -8068,7 +8322,7 @@ export class FoundryDataAccess {
     // the message's language flag. A whisper stays out of that mode, so it gets no bubble.
     const chatMessage = await ChatMessage.create(
       messageData,
-      (whisperIds.length > 0 ? {} : { messageMode: 'ic' }) as any
+      (whisperIds.length > 0 || narration ? {} : { messageMode: 'ic' }) as any
     );
 
     return {
@@ -8082,13 +8336,270 @@ export class FoundryDataAccess {
   }
 
   /**
+   * Use a Stars / Worlds Without Number item without the system's roll dialog,
+   * and report the dice that were rolled. Returns null for item kinds that have
+   * no dialog-free path, so the caller falls back to the normal behaviour.
+   */
+  private async useWithoutNumberItem(
+    systemId: string,
+    actor: any,
+    item: any,
+    options: {
+      modifier?: number | undefined;
+      burst?: boolean | undefined;
+      attackMode?: string | undefined;
+      attribute?: string | undefined;
+    } = {},
+    hasTargets = false
+  ): Promise<{
+    rolls: Array<{ formula: string; total: number; flavor?: string }>;
+    cards: string[];
+    applied: string[];
+  } | null> {
+    let run: (() => any) | null = null;
+    const applied: string[] = [];
+    const modifier = Number.isFinite(Number(options.modifier)) ? Number(options.modifier) : 0;
+    const attribute = String(options.attribute ?? '')
+      .toLowerCase()
+      .trim()
+      .slice(0, 3);
+    const attributes = ['str', 'dex', 'con', 'int', 'wis', 'cha'];
+    if (attribute && !attributes.includes(attribute)) {
+      throw new Error(
+        `Unknown attribute "${options.attribute}". Use one of: ${attributes.join(', ')}.`
+      );
+    }
+    if (modifier) applied.push(`modifier ${modifier > 0 ? '+' : ''}${modifier}`);
+
+    if (systemId === 'wwn') {
+      const s = item.system ?? {};
+      // The wwn roll code takes no extra modifier or attribute when its dialog is
+      // skipped, so adjust the prepared (in-memory) item for the length of the
+      // roll and put it back. Nothing is saved to the item.
+      const during = async (changes: Record<string, any>, roll: () => any): Promise<void> => {
+        const before: Record<string, any> = {};
+        for (const [key, value] of Object.entries(changes)) {
+          before[key] = s[key];
+          s[key] = value;
+        }
+        try {
+          await roll();
+        } finally {
+          for (const [key, value] of Object.entries(before)) s[key] = value;
+        }
+      };
+      if (item.type === 'weapon' && typeof actor.rollAttack === 'function') {
+        // Same data the system's own rollWeapon() builds.
+        const both = !!(s.missile && s.melee) && actor.type === 'character';
+        if (both && !options.attackMode) {
+          throw new Error(
+            `${item.name} can be used in melee or as a missile. Ask the GM which, then call again with attackMode "melee" or "missile".`
+          );
+        }
+        const type =
+          actor.type !== 'character'
+            ? 'attack'
+            : both
+              ? options.attackMode!
+              : s.missile && !s.melee
+                ? 'missile'
+                : 'melee';
+        if (both) applied.push(type);
+        const rollData = {
+          ...(actor._getRollData?.() || {}),
+          item,
+          actor,
+          roll: { save: s.save, target: null },
+        };
+        run = () =>
+          during(modifier ? { bonus: (Number(s.bonus) || 0) + modifier } : {}, () =>
+            hasTargets
+              ? actor.targetAttack(rollData, type, { skipDialog: true })
+              : actor.rollAttack(rollData, { type, skipDialog: true })
+          );
+      } else if (item.type === 'skill' && typeof item.rollSkill === 'function') {
+        const changes: Record<string, any> = {};
+        if (modifier) changes.ownedLevel = (Number(s.ownedLevel) || 0) + modifier;
+        if (attribute) {
+          changes.score = attribute;
+          applied.push(`attribute ${attribute.toUpperCase()}`);
+        }
+        run = () => during(changes, () => item.rollSkill({ skipDialog: true }));
+      }
+    } else if (systemId === 'swnr') {
+      const data = item.system ?? {};
+      if (item.type === 'weapon' && typeof data.rollAttack === 'function') {
+        if (data.hasAmmo === false) throw new Error(`${item.name} is out of ammo`);
+        const isCharacter = actor.type === 'character';
+        const stats = actor.system?.stats ?? {};
+        let statName = attribute || (data.stat && data.stat !== 'ask' ? data.stat : '');
+        if (isCharacter && !statName) {
+          throw new Error(
+            `${item.name} has no set attribute. Ask the GM which attribute to attack with, then call again with attribute.`
+          );
+        }
+        const second = data.secondStat;
+        if (
+          isCharacter &&
+          !attribute &&
+          second &&
+          second !== 'none' &&
+          (stats[statName]?.mod ?? 0) < (stats[second]?.mod ?? 0)
+        ) {
+          statName = second;
+        }
+        const statMod = isCharacter ? (stats[statName]?.mod ?? 0) : 0;
+        const skill = data.skill ? actor.getEmbeddedDocument?.('Item', data.skill) : null;
+        const rank = skill?.system?.rank;
+        // Characters: skill level, or -2 unskilled. An NPC's attack bonus already
+        // covers its training (the dialog's "skilled" box is off unless ticked).
+        const skillMod = isCharacter ? (typeof rank === 'number' && rank >= 0 ? rank : -2) : 0;
+        let damageBonus = 0;
+        if (data.skillBoostsDamage) {
+          damageBonus = isCharacter
+            ? Math.max(rank ?? 0, 0)
+            : Number(actor.system?.skillBonus) || 0;
+        }
+        if (!isCharacter) damageBonus += Number(actor.system?.attacks?.bonusDamage) || 0;
+        const ammo = data.ammo ?? {};
+        const canBurst = ammo.type !== 'none' && !!ammo.burst;
+        if (options.burst && !canBurst) throw new Error(`${item.name} cannot burst fire.`);
+        if (options.burst && ammo.type !== 'infinite' && (Number(ammo.value) || 0) < 3) {
+          throw new Error(`${item.name} does not have the 3 rounds a burst needs.`);
+        }
+        if (options.burst) applied.push('burst fire');
+        if (attribute) applied.push(`attribute ${attribute.toUpperCase()}`);
+        run = () => data.rollAttack(damageBonus, statMod, skillMod, modifier, !!options.burst);
+      } else if (
+        item.type === 'skill' &&
+        actor.type === 'character' &&
+        typeof data.rollSkill === 'function'
+      ) {
+        const statName =
+          attribute || (data.defaultStat && data.defaultStat !== 'ask' ? data.defaultStat : '');
+        if (!statName) {
+          throw new Error(
+            `${item.name} has no default attribute. Ask the GM which attribute to roll it with, then call again with attribute.`
+          );
+        }
+        const dice = data.pool && data.pool !== 'ask' ? data.pool : '2d6';
+        const stat = actor.system?.stats?.[statName] ?? { mod: 0 };
+        const short =
+          (game.i18n as any)?.localize?.(`swnr.stat.short.${statName}`) ?? statName.toUpperCase();
+        if (attribute) applied.push(`attribute ${attribute.toUpperCase()}`);
+        run = () =>
+          data.rollSkill(item.name, short, stat.mod ?? 0, dice, data.rank ?? -1, modifier);
+      }
+    }
+
+    if (!run) return null;
+
+    // Collect the chat messages the roll produces, so the caller gets the result.
+    const rolls: Array<{ formula: string; total: number; flavor?: string }> = [];
+    const cards: string[] = [];
+    let lastSeen = 0;
+    const hookId = (Hooks as any).on('createChatMessage', (message: any) => {
+      const mine = message.speaker?.actor === actor.id || message.author?.id === game.user?.id;
+      if (!mine) return;
+      const flavor = message.flavor
+        ? String(message.flavor)
+            .replace(/<[^>]+>/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .slice(0, 120)
+        : '';
+      for (const r of message.rolls ?? []) {
+        rolls.push({ formula: r.formula, total: r.total, ...(flavor ? { flavor } : {}) });
+      }
+      // Some systems (wwn) render the dice into the card and attach no Roll
+      // objects; pass the card's text on so the outcome is still reported.
+      if (!message.rolls?.length) {
+        const text = String(message.content ?? '')
+          .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+          .replace(/<button[\s\S]*?<\/button>/gi, ' ')
+          .replace(/<[^>]+>/g, ' ')
+          .replace(/\s+/g, ' ')
+          .trim();
+        if (text) cards.push(text.length > 300 ? text.slice(0, 300) + '…' : text);
+      }
+      lastSeen = Date.now();
+    });
+    try {
+      await Promise.resolve(run());
+      // The systems post their messages without always awaiting them: wait for
+      // the first, then for a short quiet spell (attack, then damage).
+      const started = Date.now();
+      while (Date.now() - started < 4000) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+        if (lastSeen && Date.now() - lastSeen > 500) break;
+      }
+    } finally {
+      (Hooks as any).off('createChatMessage', hookId);
+    }
+    return { rolls, cards, applied };
+  }
+
+  /**
+   * Recent chat-log messages, oldest first, as plain text with any dice results.
+   * This is how a caller learns what a requested roll came to.
+   */
+  listChatMessages(data: { limit?: number; rollsOnly?: boolean; speaker?: string }): any {
+    this.validateFoundryState();
+    const limit = Math.min(Math.max(Number(data.limit) || 20, 1), 100);
+    const wanted = data.speaker?.toLowerCase().trim();
+    const userName = (id: string): string => (game.users as any)?.get(id)?.name ?? id;
+    const plain = (html: string): string => {
+      const text = String(html ?? '')
+        .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/&nbsp;/g, ' ')
+        .replace(/&amp;/g, '&')
+        .replace(/\s+/g, ' ')
+        .trim();
+      return text.length > 400 ? text.slice(0, 400) + '…' : text;
+    };
+
+    let messages: any[] = Array.from((game.messages as any)?.contents ?? []);
+    if (data.rollsOnly) messages = messages.filter(m => (m.rolls?.length ?? 0) > 0);
+    if (wanted) {
+      messages = messages.filter(m =>
+        [m.speaker?.alias, m.author?.name].some(n => n?.toLowerCase().includes(wanted))
+      );
+    }
+    const total = messages.length;
+
+    return {
+      success: true,
+      total,
+      messages: messages.slice(-limit).map(m => {
+        const rolls = (m.rolls ?? []).map((r: any) => ({
+          formula: r.formula,
+          total: r.total,
+          dice: (r.dice ?? []).flatMap((d: any) => (d.results ?? []).map((x: any) => x.result)),
+        }));
+        return {
+          id: m.id,
+          time: new Date(m.timestamp).toISOString(),
+          author: m.author?.name,
+          speaker: m.speaker?.alias || m.author?.name,
+          ...(m.whisper?.length ? { whisperedTo: m.whisper.map(userName) } : {}),
+          ...(m.flavor ? { flavor: plain(m.flavor) } : {}),
+          ...(rolls.length ? { rolls } : {}),
+          text: rolls.length ? '' : plain(m.content),
+        };
+      }),
+    };
+  }
+
+  /**
    * Get friendly NPCs from current scene
    */
   async getFriendlyNPCs(): Promise<Array<{ id: string; name: string }>> {
     this.validateFoundryState();
 
     try {
-      const scene = game.scenes?.find(s => s.active);
+      // Same scene the other token tools use: the one the Gamemaster is viewing.
+      const scene = (game.scenes as any)?.current ?? game.scenes?.find(s => s.active);
       if (!scene) {
         return [];
       }
@@ -8102,7 +8613,7 @@ export class FoundryDataAccess {
           id: token.actor?.id || token.id || '',
           name: token.name || token.actor?.name || 'Unknown',
         }))
-        .filter(t => t.id);
+        .filter((t: { id: string; name: string }) => t.id);
     } catch (error) {
       console.error(`[${MODULE_ID}] Error getting friendly NPCs:`, error);
       return [];
@@ -8371,6 +8882,15 @@ export class FoundryDataAccess {
 
       // Activate the scene
       await targetScene.activate();
+      // Activation normally moves every client to the scene. Make sure this
+      // Gamemaster is looking at it too, since the token tools act on the viewed scene.
+      if ((game.scenes as any).current?.id !== targetScene.id) {
+        try {
+          await (targetScene as any).view();
+        } catch (error) {
+          console.warn(`[${this.moduleId}] Could not view scene after activating it:`, error);
+        }
+      }
 
       // Optimize view if requested (default true)
       if (options.optimize_view !== false && typeof canvas !== 'undefined' && canvas?.scene) {
@@ -8399,9 +8919,10 @@ export class FoundryDataAccess {
         success: true,
         sceneId: targetScene.id,
         sceneName: targetScene.name,
+        // The scene's own size; scene.dimensions includes the padding around it.
         dimensions: {
-          width: (targetScene.dimensions as any)?.width || (targetScene as any).width || 0,
-          height: (targetScene.dimensions as any)?.height || (targetScene as any).height || 0,
+          width: (targetScene as any).width || (targetScene.dimensions as any)?.sceneWidth || 0,
+          height: (targetScene as any).height || (targetScene.dimensions as any)?.sceneHeight || 0,
         },
       };
     } catch (error) {
@@ -8638,7 +9159,8 @@ export class FoundryDataAccess {
         if (options.sorting !== undefined) data.sorting = options.sorting;
         if (options.folder !== undefined) data.folder = options.folder;
         if (options.color !== undefined) data.color = options.color;
-        const pl = await ((game as any).playlists as any).createDocuments([data]);
+        // createDocuments is a static of the Playlist class, not of the world collection.
+        const pl = await ((game as any).playlists.documentClass as any).createDocuments([data]);
         const doc = Array.isArray(pl) ? pl[0] : pl;
 
         let soundsCreated = 0;
@@ -9130,7 +9652,10 @@ export class FoundryDataAccess {
         y: token.y,
         width: token.width,
         height: token.height,
-        rotation: token.rotation,
+        // The prepared value trails the stored one until the canvas finishes
+        // animating, which never happens in a hidden tab; report what is stored.
+        rotation: token._source?.rotation ?? token.rotation,
+        conditions: Array.from((token.actor?.statuses as Set<string> | undefined) ?? []),
         scale: token.texture?.scaleX || 1,
         alpha: token.alpha,
         hidden: token.hidden,
@@ -9514,6 +10039,10 @@ export class FoundryDataAccess {
           skipDialog?: boolean | undefined; // Skip confirmation dialogs (default: true for MCP)
           spellLevel?: number | undefined; // For spells: cast at higher level
           versatile?: boolean | undefined; // For versatile weapons: use versatile damage
+          modifier?: number | undefined; // SWN/WWN: situational modifier to the roll
+          burst?: boolean | undefined; // SWN: burst fire
+          attackMode?: 'melee' | 'missile' | undefined; // WWN: weapon usable both ways
+          attribute?: string | undefined; // SWN/WWN skills: attribute to roll with
         }
       | undefined;
   }): Promise<{
@@ -9557,8 +10086,22 @@ export class FoundryDataAccess {
       // we fire-and-forget to avoid timeout issues. The GM will interact
       // with the dialog in Foundry, and the result appears in chat.
 
-      // Check if item has a use() method (common in D&D 5e, PF2e)
-      if (typeof itemAny.use === 'function') {
+      // Stars / Worlds Without Number: roll straight away with the sheet's own
+      // numbers instead of opening the system's roll dialog on the GM's screen.
+      const direct =
+        systemId === 'swnr' || systemId === 'wwn'
+          ? await this.useWithoutNumberItem(
+              systemId,
+              actor,
+              itemAny,
+              options,
+              targeting.applied.length > 0
+            )
+          : null;
+
+      if (direct) {
+        // Handled above; the result is reported below.
+      } else if (typeof itemAny.use === 'function') {
         // D&D 5e and similar systems
         // Only pass options that D&D 5e's item.use() expects
         const useOptions: Record<string, any> = {
@@ -9596,10 +10139,13 @@ export class FoundryDataAccess {
           });
         }
       } else if (typeof itemAny.roll === 'function') {
-        // Some items have a roll method
-        itemAny.roll().catch((err: Error) => {
-          console.error(`[foundry-mcp-bridge] Error using item ${item.name}:`, err);
-        });
+        // Some items have a roll method. It is not always async (WWN's returns
+        // nothing), so never assume a promise comes back.
+        Promise.resolve()
+          .then(() => itemAny.roll())
+          .catch((err: Error) => {
+            console.error(`[foundry-mcp-bridge] Error using item ${item.name}:`, err);
+          });
       } else if (systemId === 'dsa5') {
         // DSA5 specific handling
         if (
@@ -9685,6 +10231,22 @@ export class FoundryDataAccess {
       }
       if (warnings.length > 0) {
         result.warnings = warnings;
+      }
+      if (direct) {
+        const totals = [
+          ...direct.rolls.map(r => `${r.formula} = ${r.total}`),
+          ...direct.cards,
+        ].join('; ');
+        (result as any).status = totals ? 'rolled' : 'completed';
+        if (direct.rolls.length) (result as any).rolls = direct.rolls;
+        if (direct.cards.length) (result as any).chatCards = direct.cards;
+        result.requiresGMInteraction = false;
+        result.message =
+          `${actor.name} used ${item.name}${targetInfo}.${targetingWarningInfo} ` +
+          (direct.applied.length ? `With ${direct.applied.join(', ')}. ` : '') +
+          (totals
+            ? `Rolled without a dialog: ${totals}`
+            : 'No dialog was needed; the result is in chat.');
       }
 
       return result;

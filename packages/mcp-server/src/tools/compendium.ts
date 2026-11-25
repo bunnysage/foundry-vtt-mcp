@@ -42,9 +42,8 @@ export class CompendiumTools {
   private async getGameSystem(): Promise<GameSystem> {
     // Don't cache 'other' — it likely means Foundry wasn't connected yet.
     // Retry detection on every call until we get a real system ID.
-    if (!this.gameSystem || this.gameSystem === 'other') {
-      this.gameSystem = await detectGameSystem(this.foundryClient, this.logger);
-    }
+    // detectGameSystem keeps its own cache, cleared whenever Foundry reconnects.
+    this.gameSystem = await detectGameSystem(this.foundryClient, this.logger);
     return this.gameSystem;
   }
 
@@ -194,7 +193,7 @@ export class CompendiumTools {
       {
         name: 'list-creatures-by-criteria',
         description:
-          'MULTI-SYSTEM CREATURE DISCOVERY: Get a comprehensive list of creatures matching specific criteria. Supports D&D 5e (Challenge Rating), Pathfinder 2e (Level), and Cosmere RPG (Tier/Role/Investiture) with automatic system detection. Perfect for encounter building - returns minimal data so Claude can use built-in monster knowledge to identify suitable creatures by name, then pull full details only for final selections. Features intelligent pack prioritization and high result limits for complete surveys.',
+          'MULTI-SYSTEM CREATURE DISCOVERY: Get a comprehensive list of creatures matching specific criteria. Supports D&D 5e (Challenge Rating), Pathfinder 2e (Level), Cosmere RPG (Tier/Role/Investiture), and Stars/Worlds Without Number (hit dice, hit points, armor class) with automatic system detection. Perfect for encounter building - returns minimal data so Claude can use built-in monster knowledge to identify suitable creatures by name, then pull full details only for final selections. Features intelligent pack prioritization and high result limits for complete surveys.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -246,6 +245,28 @@ export class CompendiumTools {
             hasLegendaryActions: {
               type: 'boolean',
               description: 'Filter for creatures with legendary actions (D&D 5e)',
+            },
+            // Stars / Worlds Without Number filters
+            hitDice: {
+              oneOf: [
+                { type: 'number', description: 'Exact hit dice' },
+                {
+                  type: 'object',
+                  properties: { min: { type: 'number' }, max: { type: 'number' } },
+                  description: 'Hit dice range, e.g. {"min": 2, "max": 4}',
+                },
+              ],
+              description: 'Filter by hit dice (Stars/Worlds Without Number)',
+            },
+            minHitPoints: { type: 'number', description: 'Minimum hit points (SWN/WWN)' },
+            maxHitPoints: { type: 'number', description: 'Maximum hit points (SWN/WWN)' },
+            minArmorClass: { type: 'number', description: 'Minimum armor class (SWN/WWN)' },
+            maxArmorClass: { type: 'number', description: 'Maximum armor class (SWN/WWN)' },
+            hasPsionics: { type: 'boolean', description: 'Only psionic creatures (SWN)' },
+            hasMagic: { type: 'boolean', description: 'Only spellcasting creatures (WWN)' },
+            actorType: {
+              type: 'string',
+              description: 'Actor type to match, e.g. "npc" or "ship" (SWN), "monster" (WWN)',
             },
             // Pathfinder 2e specific filters
             level: {
@@ -689,6 +710,74 @@ export class CompendiumTools {
         ])
         .optional(),
 
+      // Stars / Worlds Without Number: hit dice, hit points, armour class
+      hitDice: z
+        .union([
+          z.object({ min: z.number().optional(), max: z.number().optional() }),
+          z.number().transform(n => ({ min: n, max: n })),
+          z
+            .string()
+            .refine(val => !isNaN(parseFloat(val)))
+            .transform(val => ({ min: parseFloat(val), max: parseFloat(val) })),
+        ])
+        .optional(),
+      minHitPoints: z
+        .union([
+          z.number(),
+          z
+            .string()
+            .refine(val => !isNaN(parseFloat(val)))
+            .transform(val => parseFloat(val)),
+        ])
+        .optional(),
+      maxHitPoints: z
+        .union([
+          z.number(),
+          z
+            .string()
+            .refine(val => !isNaN(parseFloat(val)))
+            .transform(val => parseFloat(val)),
+        ])
+        .optional(),
+      minArmorClass: z
+        .union([
+          z.number(),
+          z
+            .string()
+            .refine(val => !isNaN(parseFloat(val)))
+            .transform(val => parseFloat(val)),
+        ])
+        .optional(),
+      maxArmorClass: z
+        .union([
+          z.number(),
+          z
+            .string()
+            .refine(val => !isNaN(parseFloat(val)))
+            .transform(val => parseFloat(val)),
+        ])
+        .optional(),
+      hasPsionics: z
+        .union([
+          z.boolean(),
+          z
+            .string()
+            .refine(val => ['true', 'false'].includes(val.toLowerCase()))
+            .transform(val => val.toLowerCase() === 'true'),
+        ])
+        .optional(),
+      hasMagic: z
+        .union([
+          z.boolean(),
+          z
+            .string()
+            .refine(val => ['true', 'false'].includes(val.toLowerCase()))
+            .transform(val => val.toLowerCase() === 'true'),
+        ])
+        .optional(),
+      tags: z.array(z.string()).optional(),
+      actorType: z.string().optional(),
+
       // Spellcasting flags (different names per system)
       hasSpells: z
         .union([
@@ -779,7 +868,7 @@ export class CompendiumTools {
         criteria: params,
         searchSummary: {
           ...searchSummary,
-          searchStrategy: `Prioritized pack search - ${gameSystem === 'pf2e' ? 'PF2e' : gameSystem === 'cosmere-rpg' ? 'Cosmere RPG' : gameSystem === 'mgt2e' ? 'Mongoose Traveller 2e' : 'D&D 5e'} content first, then modules, then campaign-specific`,
+          searchStrategy: `Prioritized pack search - ${gameSystem === 'pf2e' ? 'PF2e' : gameSystem === 'cosmere-rpg' ? 'Cosmere RPG' : gameSystem === 'mgt2e' ? 'Mongoose Traveller 2e' : gameSystem === 'swnr' ? 'Stars Without Number' : gameSystem === 'wwn' ? 'Worlds Without Number' : 'D&D 5e'} content first, then modules, then campaign-specific`,
           note: 'Packs searched in priority order to find most relevant creatures first',
         },
         optimizationNote:
@@ -847,9 +936,30 @@ export class CompendiumTools {
       summary: this.createItemSummary(item),
     };
 
+    // Stats attached by the Foundry module from its saved creature index.
+    if (item.stats && Object.keys(item.stats).length > 0) {
+      formatted.stats = item.stats;
+      const s = item.stats;
+      const bits = [
+        s.hitDice !== undefined ? `HD ${s.hitDice}` : '',
+        s.challengeRating !== undefined ? `CR ${s.challengeRating}` : '',
+        s.level !== undefined ? `Level ${s.level}` : '',
+        s.hitPoints !== undefined ? `HP ${s.hitPoints}` : '',
+        s.armorClass !== undefined ? `AC ${s.armorClass}` : '',
+      ].filter(Boolean);
+      if (bits.length) formatted.summary = `${bits.join(', ')} — ${formatted.summary}`;
+      return formatted;
+    }
+
     // Add key stats for actors/creatures to reduce need for detail calls.
     // `adversary` is Cosmere RPG's NPC equivalent.
-    if (item.type === 'npc' || item.type === 'character' || item.type === 'adversary') {
+    // `monster` is Worlds Without Number's NPC type.
+    if (
+      item.type === 'npc' ||
+      item.type === 'character' ||
+      item.type === 'adversary' ||
+      item.type === 'monster'
+    ) {
       const stats: any = {};
 
       // Use system detection utilities for accurate stat extraction
@@ -867,6 +977,14 @@ export class CompendiumTools {
         } else if (item.type === 'spacecraft') {
           if (system.spacecraft?.dtons) stats.dtons = system.spacecraft.dtons;
         }
+      } else if (gameSystem === 'swnr' || gameSystem === 'wwn') {
+        const system = item.system || {};
+        const hd = system.hitDice ?? system.hp?.hd;
+        if (hd !== undefined && hd !== '') stats.hitDice = hd;
+        const hp = system.health?.max ?? system.hp?.max;
+        if (hp !== undefined) stats.hitPoints = hp;
+        const ac = system.ac ?? system.aac?.value ?? system.baseAc;
+        if (ac !== undefined) stats.armorClass = ac;
       } else if (gameSystem === 'cosmere-rpg') {
         const system = item.system || {};
 
@@ -1082,6 +1200,19 @@ export class CompendiumTools {
       id: creature.id,
       pack: { id: creature.pack, label: creature.packLabel },
     };
+
+    if (gameSystem === 'swnr' || gameSystem === 'wwn') {
+      // Without Number fields come pre-flattened from data-access.ts.
+      if (creature.type) formatted.type = creature.type;
+      if (creature.hitDice !== undefined) formatted.hitDice = creature.hitDice;
+      if (creature.hitPoints !== undefined) formatted.hitPoints = creature.hitPoints;
+      if (creature.armorClass !== undefined) formatted.armorClass = creature.armorClass;
+      if (creature.hasPsionics !== undefined) formatted.hasPsionics = creature.hasPsionics;
+      if (creature.hasMagic !== undefined) formatted.hasMagic = creature.hasMagic;
+      if (creature.tags?.length) formatted.tags = creature.tags;
+      if (creature.summary) formatted.summary = creature.summary;
+      return formatted;
+    }
 
     if (gameSystem === 'cosmere-rpg') {
       // Cosmere fields come pre-flattened from data-access.ts; pass them through.
