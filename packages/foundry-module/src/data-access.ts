@@ -8336,6 +8336,131 @@ export class FoundryDataAccess {
   }
 
   /**
+   * Use a Stars / Worlds Without Number item without the system's roll dialog,
+   * and report the dice that were rolled. Returns null for item kinds that have
+   * no dialog-free path, so the caller falls back to the normal behaviour.
+   */
+  private async useWithoutNumberItem(
+    systemId: string,
+    actor: any,
+    item: any
+  ): Promise<{
+    rolls: Array<{ formula: string; total: number; flavor?: string }>;
+    cards: string[];
+  } | null> {
+    let run: (() => any) | null = null;
+
+    if (systemId === 'wwn') {
+      if (item.type === 'weapon' && typeof actor.targetAttack === 'function') {
+        // Same data the system's own rollWeapon() builds. A weapon usable both
+        // ways is rolled as melee rather than asking which.
+        const s = item.system ?? {};
+        const type =
+          actor.type !== 'character' ? 'attack' : s.missile && !s.melee ? 'missile' : 'melee';
+        const rollData = {
+          ...(actor._getRollData?.() || {}),
+          item,
+          actor,
+          roll: { save: s.save, target: null },
+        };
+        run = () => actor.targetAttack(rollData, type, { skipDialog: true });
+      } else if (item.type === 'skill' && typeof item.rollSkill === 'function') {
+        run = () => item.rollSkill({ skipDialog: true });
+      }
+    } else if (systemId === 'swnr') {
+      const data = item.system ?? {};
+      if (item.type === 'weapon' && typeof data.rollAttack === 'function') {
+        if (data.hasAmmo === false) throw new Error(`${item.name} is out of ammo`);
+        const isCharacter = actor.type === 'character';
+        const stats = actor.system?.stats ?? {};
+        let statName = data.stat && data.stat !== 'ask' ? data.stat : 'dex';
+        const second = data.secondStat;
+        if (
+          isCharacter &&
+          second &&
+          second !== 'none' &&
+          (stats[statName]?.mod ?? 0) < (stats[second]?.mod ?? 0)
+        ) {
+          statName = second;
+        }
+        const statMod = isCharacter ? (stats[statName]?.mod ?? 0) : 0;
+        const skill = data.skill ? actor.getEmbeddedDocument?.('Item', data.skill) : null;
+        const rank = skill?.system?.rank;
+        // Characters: skill level, or -2 unskilled. An NPC's attack bonus already
+        // covers its training (the dialog's "skilled" box is off unless ticked).
+        const skillMod = isCharacter ? (typeof rank === 'number' && rank >= 0 ? rank : -2) : 0;
+        let damageBonus = 0;
+        if (data.skillBoostsDamage) {
+          damageBonus = isCharacter
+            ? Math.max(rank ?? 0, 0)
+            : Number(actor.system?.skillBonus) || 0;
+        }
+        if (!isCharacter) damageBonus += Number(actor.system?.attacks?.bonusDamage) || 0;
+        run = () => data.rollAttack(damageBonus, statMod, skillMod, 0, false);
+      } else if (
+        item.type === 'skill' &&
+        actor.type === 'character' &&
+        typeof data.rollSkill === 'function' &&
+        data.defaultStat &&
+        data.defaultStat !== 'ask' &&
+        data.pool &&
+        data.pool !== 'ask'
+      ) {
+        const stat = actor.system?.stats?.[data.defaultStat] ?? { mod: 0 };
+        const short =
+          (game.i18n as any)?.localize?.(`swnr.stat.short.${data.defaultStat}`) ?? data.defaultStat;
+        run = () => data.rollSkill(item.name, short, stat.mod ?? 0, data.pool, data.rank ?? -1, 0);
+      }
+    }
+
+    if (!run) return null;
+
+    // Collect the chat messages the roll produces, so the caller gets the result.
+    const rolls: Array<{ formula: string; total: number; flavor?: string }> = [];
+    const cards: string[] = [];
+    let lastSeen = 0;
+    const hookId = (Hooks as any).on('createChatMessage', (message: any) => {
+      const mine = message.speaker?.actor === actor.id || message.author?.id === game.user?.id;
+      if (!mine) return;
+      const flavor = message.flavor
+        ? String(message.flavor)
+            .replace(/<[^>]+>/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .slice(0, 120)
+        : '';
+      for (const r of message.rolls ?? []) {
+        rolls.push({ formula: r.formula, total: r.total, ...(flavor ? { flavor } : {}) });
+      }
+      // Some systems (wwn) render the dice into the card and attach no Roll
+      // objects; pass the card's text on so the outcome is still reported.
+      if (!message.rolls?.length) {
+        const text = String(message.content ?? '')
+          .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+          .replace(/<button[\s\S]*?<\/button>/gi, ' ')
+          .replace(/<[^>]+>/g, ' ')
+          .replace(/\s+/g, ' ')
+          .trim();
+        if (text) cards.push(text.length > 300 ? text.slice(0, 300) + '…' : text);
+      }
+      lastSeen = Date.now();
+    });
+    try {
+      await Promise.resolve(run());
+      // The systems post their messages without always awaiting them: wait for
+      // the first, then for a short quiet spell (attack, then damage).
+      const started = Date.now();
+      while (Date.now() - started < 4000) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+        if (lastSeen && Date.now() - lastSeen > 500) break;
+      }
+    } finally {
+      (Hooks as any).off('createChatMessage', hookId);
+    }
+    return { rolls, cards };
+  }
+
+  /**
    * Recent chat-log messages, oldest first, as plain text with any dice results.
    * This is how a caller learns what a requested roll came to.
    */
@@ -9878,8 +10003,16 @@ export class FoundryDataAccess {
       // we fire-and-forget to avoid timeout issues. The GM will interact
       // with the dialog in Foundry, and the result appears in chat.
 
-      // Check if item has a use() method (common in D&D 5e, PF2e)
-      if (typeof itemAny.use === 'function') {
+      // Stars / Worlds Without Number: roll straight away with the sheet's own
+      // numbers instead of opening the system's roll dialog on the GM's screen.
+      const direct =
+        systemId === 'swnr' || systemId === 'wwn'
+          ? await this.useWithoutNumberItem(systemId, actor, itemAny)
+          : null;
+
+      if (direct) {
+        // Handled above; the result is reported below.
+      } else if (typeof itemAny.use === 'function') {
         // D&D 5e and similar systems
         // Only pass options that D&D 5e's item.use() expects
         const useOptions: Record<string, any> = {
@@ -10009,6 +10142,21 @@ export class FoundryDataAccess {
       }
       if (warnings.length > 0) {
         result.warnings = warnings;
+      }
+      if (direct) {
+        const totals = [
+          ...direct.rolls.map(r => `${r.formula} = ${r.total}`),
+          ...direct.cards,
+        ].join('; ');
+        (result as any).status = totals ? 'rolled' : 'completed';
+        if (direct.rolls.length) (result as any).rolls = direct.rolls;
+        if (direct.cards.length) (result as any).chatCards = direct.cards;
+        result.requiresGMInteraction = false;
+        result.message =
+          `${actor.name} used ${item.name}${targetInfo}.${targetingWarningInfo} ` +
+          (totals
+            ? `Rolled without a dialog: ${totals}`
+            : 'No dialog was needed; the result is in chat.');
       }
 
       return result;
