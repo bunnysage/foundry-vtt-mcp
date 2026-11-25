@@ -2,6 +2,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { createServer } from 'http';
 import { Logger } from './logger.js';
 import { Config } from './config.js';
+import { clearSystemCache } from './utils/system-detection.js';
 import { WebRTCPeer } from './webrtc-peer.js';
 
 export interface FoundryConnectorOptions {
@@ -122,6 +123,8 @@ export class FoundryConnector {
       if (!this.foundrySocket) {
         this.foundrySocket = ws;
         this.activeConnectionType = 'websocket';
+        // A new Foundry session may be a different world and game system.
+        clearSystemCache();
         this.logger.info('Foundry module registered via WebSocket');
       }
 
@@ -284,6 +287,8 @@ export class FoundryConnector {
       );
 
       this.activeConnectionType = 'webrtc';
+      // A new Foundry session may be a different world and game system.
+      clearSystemCache();
       this.logger.info('WebRTC connection established');
 
       // Close signaling WebSocket after handshake
@@ -340,6 +345,8 @@ export class FoundryConnector {
       const answer = await this.webrtcPeer.handleOffer(offer);
 
       this.activeConnectionType = 'webrtc';
+      // A new Foundry session may be a different world and game system.
+      clearSystemCache();
       this.logger.info('WebRTC connection established via HTTP signaling');
 
       // Send answer back via HTTP response

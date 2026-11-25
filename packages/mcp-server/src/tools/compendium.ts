@@ -42,9 +42,8 @@ export class CompendiumTools {
   private async getGameSystem(): Promise<GameSystem> {
     // Don't cache 'other' — it likely means Foundry wasn't connected yet.
     // Retry detection on every call until we get a real system ID.
-    if (!this.gameSystem || this.gameSystem === 'other') {
-      this.gameSystem = await detectGameSystem(this.foundryClient, this.logger);
-    }
+    // detectGameSystem keeps its own cache, cleared whenever Foundry reconnects.
+    this.gameSystem = await detectGameSystem(this.foundryClient, this.logger);
     return this.gameSystem;
   }
 

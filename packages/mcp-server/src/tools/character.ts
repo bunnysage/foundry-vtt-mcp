@@ -28,9 +28,9 @@ export class CharacterTools {
    */
   private async getGameSystem(): Promise<GameSystem> {
     // Don't cache 'other' — it likely means Foundry wasn't connected yet.
-    if (!this.cachedGameSystem || this.cachedGameSystem === 'other') {
-      this.cachedGameSystem = await detectGameSystem(this.foundryClient, this.logger);
-    }
+    // detectGameSystem keeps its own cache, cleared whenever Foundry reconnects
+    // (the GM may have opened a world that uses a different system).
+    this.cachedGameSystem = await detectGameSystem(this.foundryClient, this.logger);
     return this.cachedGameSystem;
   }
 

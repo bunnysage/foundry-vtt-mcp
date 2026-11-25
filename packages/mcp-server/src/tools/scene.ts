@@ -161,6 +161,8 @@ export class SceneTools {
         height: sceneData.height,
         padding: sceneData.padding,
       },
+      // Pixels per grid square: token x/y are in pixels, so one square is this many.
+      ...(sceneData.gridSize ? { gridSize: sceneData.gridSize } : {}),
       hasBackground: !!sceneData.background,
       navigation: sceneData.navigation,
       music: sceneData.music || { playlist: null, playlistSound: null },

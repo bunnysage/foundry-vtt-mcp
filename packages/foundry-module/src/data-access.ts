@@ -245,6 +245,7 @@ interface SceneInfo {
   width: number;
   height: number;
   padding: number;
+  gridSize?: number;
   active: boolean;
   navigation: boolean;
   tokens: SceneToken[];
@@ -4438,6 +4439,7 @@ export class FoundryDataAccess {
       width: scene.width,
       height: scene.height,
       padding: scene.padding,
+      gridSize: (scene as any).grid?.size,
       active: scene.active,
       // "Current" is the scene this Gamemaster is looking at, which is where the
       // token tools act. Players are on the active scene; say so when they differ.
@@ -5289,6 +5291,11 @@ export class FoundryDataAccess {
             folder: null, // Don't inherit folder
             prototypeToken: sourceData.prototypeToken, // Include prototype token
           };
+
+          // A renamed actor's tokens should carry the new name, not the compendium entry's.
+          if (actorData.prototypeToken && customName && customName !== sourceData.name) {
+            actorData.prototypeToken = { ...actorData.prototypeToken, name: customName };
+          }
 
           // Fix remote image URLs - normalize to local paths
           if (actorData.prototypeToken?.texture?.src?.startsWith('http')) {
@@ -6307,12 +6314,28 @@ export class FoundryDataAccess {
           }
 
           const tokenDoc = (actor as any).prototypeToken.toObject();
-          const position = this.calculateTokenPosition(
+          let position = this.calculateTokenPosition(
             placement.placement,
             scene,
             tokenData.length,
             placement.coordinates
           );
+          // Do not stack a new token on one that is already there (earlier calls
+          // start from the same spot). Explicit coordinates are taken as given.
+          if (placement.placement !== 'coordinates') {
+            const grid = scene.grid?.size || 100;
+            const taken = (x: number, y: number): boolean =>
+              [...scene.tokens.map((t: any) => ({ x: t.x, y: t.y })), ...tokenData].some(
+                (t: any) => Math.abs(t.x - x) < grid && Math.abs(t.y - y) < grid
+              );
+            for (let step = 0; step < 200 && taken(position.x, position.y); step++) {
+              const nextX = position.x + grid;
+              position =
+                nextX + grid <= (scene.width || nextX + grid)
+                  ? { x: nextX, y: position.y }
+                  : { x: grid, y: position.y + grid };
+            }
+          }
 
           // Fix token texture if it's still a remote URL (Foundry may have overridden our actor creation fix)
           if (tokenDoc.texture?.src?.startsWith('http')) {
@@ -6961,8 +6984,35 @@ export class FoundryDataAccess {
       case 'save':
         return '1d20';
       case 'attack': {
+        // d20 + attack bonus, and when rollTarget names a weapon the character
+        // carries: + that weapon's attribute modifier + its combat skill level
+        // (-2 when unskilled) + the weapon's own bonus.
         const ab = systemId === 'swnr' ? system.ab : system.thac0?.bba;
-        return `1d20${signed(typeof ab === 'number' ? ab : 0)}`;
+        let formula = `1d20${signed(typeof ab === 'number' ? ab : 0)}`;
+        const wanted = rollTarget.toLowerCase().trim();
+        const items: any[] = (character as any).items?.contents ?? [];
+        const weapon = wanted
+          ? items.find(i => i.type === 'weapon' && i.name?.toLowerCase() === wanted)
+          : undefined;
+        if (weapon) {
+          const w = weapon.system ?? {};
+          const attribute = String((systemId === 'swnr' ? w.stat : w.score) || '');
+          if (attribute) formula += signed(this.withoutNumberMod(systemId, character, attribute));
+          const skillRef = String(w.skill || '');
+          if (skillRef) {
+            const skillItem = items.find(
+              i =>
+                i.type === 'skill' &&
+                (i.id === skillRef || i.name?.toLowerCase() === skillRef.toLowerCase())
+            );
+            const rank =
+              systemId === 'swnr' ? skillItem?.system?.rank : skillItem?.system?.ownedLevel;
+            formula += signed(typeof rank === 'number' && rank >= 0 ? rank : -2);
+          }
+          const own = Number(systemId === 'swnr' ? w.ab : w.bonus);
+          if (Number.isFinite(own) && own !== 0) formula += signed(own);
+        }
+        return formula;
       }
       case 'initiative':
         return `1d8${signed(this.withoutNumberMod(systemId, character, 'dex'))}`;
@@ -8628,6 +8678,15 @@ export class FoundryDataAccess {
 
       // Activate the scene
       await targetScene.activate();
+      // Activation normally moves every client to the scene. Make sure this
+      // Gamemaster is looking at it too, since the token tools act on the viewed scene.
+      if ((game.scenes as any).current?.id !== targetScene.id) {
+        try {
+          await (targetScene as any).view();
+        } catch (error) {
+          console.warn(`[${this.moduleId}] Could not view scene after activating it:`, error);
+        }
+      }
 
       // Optimize view if requested (default true)
       if (options.optimize_view !== false && typeof canvas !== 'undefined' && canvas?.scene) {
