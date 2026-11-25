@@ -5169,7 +5169,14 @@ export class FoundryDataAccess {
 
       // Validate actor type - support all common actor types including DSA5 creatures
       // and Cosmere RPG adversaries.
-      const validActorTypes = ['character', 'npc', 'creature', 'adversary'];
+      // Accept whatever actor types the active system defines (WWN uses 'monster'),
+      // plus the common names used by the systems this bridge already supports.
+      const systemActorTypes: string[] = Object.keys(
+        ((game as any).system?.documentTypes?.Actor as Record<string, unknown>) ?? {}
+      );
+      const validActorTypes = [
+        ...new Set(['character', 'npc', 'creature', 'adversary', ...systemActorTypes]),
+      ];
       if (!validActorTypes.includes(sourceDocument.type)) {
         throw new Error(
           `Document "${itemId}" has unsupported actor type: ${sourceDocument.type}. Supported types: ${validActorTypes.join(', ')}`
@@ -8638,7 +8645,8 @@ export class FoundryDataAccess {
         if (options.sorting !== undefined) data.sorting = options.sorting;
         if (options.folder !== undefined) data.folder = options.folder;
         if (options.color !== undefined) data.color = options.color;
-        const pl = await ((game as any).playlists as any).createDocuments([data]);
+        // createDocuments is a static of the Playlist class, not of the world collection.
+        const pl = await ((game as any).playlists.documentClass as any).createDocuments([data]);
         const doc = Array.isArray(pl) ? pl[0] : pl;
 
         let soundsCreated = 0;
@@ -9596,10 +9604,13 @@ export class FoundryDataAccess {
           });
         }
       } else if (typeof itemAny.roll === 'function') {
-        // Some items have a roll method
-        itemAny.roll().catch((err: Error) => {
-          console.error(`[foundry-mcp-bridge] Error using item ${item.name}:`, err);
-        });
+        // Some items have a roll method. It is not always async (WWN's returns
+        // nothing), so never assume a promise comes back.
+        Promise.resolve()
+          .then(() => itemAny.roll())
+          .catch((err: Error) => {
+            console.error(`[foundry-mcp-bridge] Error using item ${item.name}:`, err);
+          });
       } else if (systemId === 'dsa5') {
         // DSA5 specific handling
         if (
