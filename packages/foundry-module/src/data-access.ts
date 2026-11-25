@@ -177,12 +177,44 @@ interface MGT2eCreatureIndex {
   img?: string;
 }
 
+interface SWNRCreatureIndex {
+  id: string;
+  name: string;
+  type: string; // character | npc | ship | faction | …
+  pack: string;
+  packLabel: string;
+  hitDice?: number;
+  hitPoints?: number;
+  armorClass?: number;
+  hasPsionics: boolean;
+  attributes?: Record<string, { value: number; mod: number }>;
+  tags?: string[];
+  img?: string;
+}
+
+interface WWNCreatureIndex {
+  id: string;
+  name: string;
+  type: string; // character | npc | monster | faction | …
+  pack: string;
+  packLabel: string;
+  hitDice?: number;
+  hitPoints?: number;
+  armorClass?: number;
+  hasMagic: boolean;
+  attributes?: Record<string, { value: number; mod: number }>;
+  tags?: string[];
+  img?: string;
+}
+
 // Union type across all supported systems
 type EnhancedCreatureIndex =
   | DnD5eCreatureIndex
   | PF2eCreatureIndex
   | CosmereRpgCreatureIndex
-  | MGT2eCreatureIndex;
+  | MGT2eCreatureIndex
+  | SWNRCreatureIndex
+  | WWNCreatureIndex;
 
 interface PersistentIndexMetadata {
   version: string;
@@ -688,6 +720,10 @@ class PersistentCreatureIndex {
       return await this.buildCosmereRpgIndex(force);
     } else if (gameSystem === 'mgt2e') {
       return await this.buildMGT2eIndex(force);
+    } else if (gameSystem === 'swnr') {
+      return await this.buildSWNRIndex(force);
+    } else if (gameSystem === 'wwn') {
+      return await this.buildWWNIndex(force);
     } else {
       // Unknown system — skip silently rather than blocking world load
       console.warn(
@@ -1525,6 +1561,299 @@ class PersistentCreatureIndex {
             creatureType,
             hasPsionics,
             characteristics: charMap,
+            img: (doc as any).img,
+          });
+        } catch {
+          errors++;
+        }
+      }
+    } catch {
+      errors++;
+    }
+
+    return { creatures, errors };
+  }
+
+  // ─── SWNR index builder ─────────────────────────────────────────────────────
+
+  private calcSWNRMod(value: number): number {
+    return Math.floor((value - 10) / 2);
+  }
+
+  private async buildSWNRIndex(_force = false): Promise<SWNRCreatureIndex[]> {
+    this.buildInProgress = true;
+    const startTime = Date.now();
+    let progressNotification: any = null;
+    let totalErrors = 0;
+
+    try {
+      const actorPacks = Array.from(game.packs.values()).filter(
+        pack => pack.metadata.type === 'Actor'
+      );
+      const enhancedCreatures: SWNRCreatureIndex[] = [];
+      const packFingerprints = new Map<string, PackFingerprint>();
+
+      this.info(`Starting SWN:R creature index build from ${actorPacks.length} packs...`);
+
+      for (let i = 0; i < actorPacks.length; i++) {
+        const pack = actorPacks[i];
+        if (!pack.indexed) await pack.getIndex({});
+        packFingerprints.set(pack.metadata.id, this.generatePackFingerprint(pack));
+
+        if (i % 3 === 0) {
+          if (progressNotification) progressNotification.remove();
+          progressNotification = this.info(
+            `Building SWN:R index... ${Math.round((i / actorPacks.length) * 100)}% — ${pack.metadata.label}`
+          );
+        }
+
+        try {
+          const result = await this.extractSWNRDataFromPack(pack);
+          enhancedCreatures.push(...result.creatures);
+          totalErrors += result.errors;
+        } catch (error) {
+          console.warn(`[${this.moduleId}] Failed to process pack ${pack.metadata.label}:`, error);
+        }
+      }
+
+      if (progressNotification) progressNotification.remove();
+
+      const persistentIndex: PersistentEnhancedIndex = {
+        metadata: {
+          version: this.INDEX_VERSION,
+          timestamp: Date.now(),
+          packFingerprints,
+          totalCreatures: enhancedCreatures.length,
+          gameSystem: 'swnr',
+        },
+        creatures: enhancedCreatures,
+      };
+
+      await this.savePersistedIndex(persistentIndex);
+
+      const secs = Math.round((Date.now() - startTime) / 1000);
+      const errText = totalErrors > 0 ? ` (${totalErrors} errors)` : '';
+      this.info(
+        `SWN:R creature index complete! ${enhancedCreatures.length} actors indexed in ${secs}s${errText}`
+      );
+
+      return enhancedCreatures;
+    } catch (error) {
+      if (progressNotification) progressNotification.remove();
+      const msg = `Failed to build SWN:R creature index: ${error instanceof Error ? error.message : 'Unknown error'}`;
+      console.error(`[${this.moduleId}] ${msg}`);
+      ui.notifications?.error(msg);
+      throw error;
+    } finally {
+      this.buildInProgress = false;
+      if (progressNotification) progressNotification.remove();
+    }
+  }
+
+  private async extractSWNRDataFromPack(
+    pack: any
+  ): Promise<{ creatures: SWNRCreatureIndex[]; errors: number }> {
+    const creatures: SWNRCreatureIndex[] = [];
+    let errors = 0;
+
+    try {
+      const documents = await pack.getDocuments();
+      for (const doc of documents) {
+        // Index character and npc actor types
+        if (!['character', 'npc'].includes(doc.type)) continue;
+
+        try {
+          const system = (doc as any).system ?? {};
+          const stats = system.stats ?? {};
+          const attrMap: Record<string, { value: number; mod: number }> = {};
+
+          for (const [k, v] of Object.entries(stats)) {
+            const val = typeof v === 'object' ? ((v as any).value ?? 10) : (v as number);
+            const mod =
+              typeof v === 'object' && (v as any).mod !== undefined
+                ? (v as any).mod
+                : this.calcSWNRMod(val);
+            attrMap[k.toUpperCase()] = { value: val, mod };
+          }
+
+          const hitPoints = system.health?.max ?? system.health?.value ?? undefined;
+          const armorClass = typeof system.ac === 'object' ? system.ac.value : system.ac;
+          const hitDice = system.hitDice ?? system.hd ?? undefined;
+
+          // Check for psionic items
+          const items: any[] = Array.isArray((doc as any).items) ? (doc as any).items : [];
+          const hasPsionics = items.some(
+            (item: any) =>
+              item.type === 'power' ||
+              (item.type === 'skill' &&
+                [
+                  'biopsionics',
+                  'metapsionics',
+                  'precognition',
+                  'telekinesis',
+                  'telepathy',
+                  'teleportation',
+                ].includes(item.name?.toLowerCase()))
+          );
+
+          const tags: string[] = system.tags || [];
+
+          creatures.push({
+            id: doc.id,
+            name: doc.name,
+            type: doc.type,
+            pack: pack.collection,
+            packLabel: pack.metadata?.label ?? pack.collection,
+            hitDice,
+            hitPoints,
+            armorClass,
+            hasPsionics,
+            attributes: attrMap,
+            tags,
+            img: (doc as any).img,
+          });
+        } catch {
+          errors++;
+        }
+      }
+    } catch {
+      errors++;
+    }
+
+    return { creatures, errors };
+  }
+
+  // ─── WWN index builder ──────────────────────────────────────────────────────
+
+  private calcWWNMod(value: number): number {
+    return Math.floor((value - 10) / 2);
+  }
+
+  private async buildWWNIndex(_force = false): Promise<WWNCreatureIndex[]> {
+    this.buildInProgress = true;
+    const startTime = Date.now();
+    let progressNotification: any = null;
+    let totalErrors = 0;
+
+    try {
+      const actorPacks = Array.from(game.packs.values()).filter(
+        pack => pack.metadata.type === 'Actor'
+      );
+      const enhancedCreatures: WWNCreatureIndex[] = [];
+      const packFingerprints = new Map<string, PackFingerprint>();
+
+      this.info(`Starting WWN creature index build from ${actorPacks.length} packs...`);
+
+      for (let i = 0; i < actorPacks.length; i++) {
+        const pack = actorPacks[i];
+        if (!pack.indexed) await pack.getIndex({});
+        packFingerprints.set(pack.metadata.id, this.generatePackFingerprint(pack));
+
+        if (i % 3 === 0) {
+          if (progressNotification) progressNotification.remove();
+          progressNotification = this.info(
+            `Building WWN index... ${Math.round((i / actorPacks.length) * 100)}% — ${pack.metadata.label}`
+          );
+        }
+
+        try {
+          const result = await this.extractWWNDataFromPack(pack);
+          enhancedCreatures.push(...result.creatures);
+          totalErrors += result.errors;
+        } catch (error) {
+          console.warn(`[${this.moduleId}] Failed to process pack ${pack.metadata.label}:`, error);
+        }
+      }
+
+      if (progressNotification) progressNotification.remove();
+
+      const persistentIndex: PersistentEnhancedIndex = {
+        metadata: {
+          version: this.INDEX_VERSION,
+          timestamp: Date.now(),
+          packFingerprints,
+          totalCreatures: enhancedCreatures.length,
+          gameSystem: 'wwn',
+        },
+        creatures: enhancedCreatures,
+      };
+
+      await this.savePersistedIndex(persistentIndex);
+
+      const secs = Math.round((Date.now() - startTime) / 1000);
+      const errText = totalErrors > 0 ? ` (${totalErrors} errors)` : '';
+      this.info(
+        `WWN creature index complete! ${enhancedCreatures.length} actors indexed in ${secs}s${errText}`
+      );
+
+      return enhancedCreatures;
+    } catch (error) {
+      if (progressNotification) progressNotification.remove();
+      const msg = `Failed to build WWN creature index: ${error instanceof Error ? error.message : 'Unknown error'}`;
+      console.error(`[${this.moduleId}] ${msg}`);
+      ui.notifications?.error(msg);
+      throw error;
+    } finally {
+      this.buildInProgress = false;
+      if (progressNotification) progressNotification.remove();
+    }
+  }
+
+  private async extractWWNDataFromPack(
+    pack: any
+  ): Promise<{ creatures: WWNCreatureIndex[]; errors: number }> {
+    const creatures: WWNCreatureIndex[] = [];
+    let errors = 0;
+
+    try {
+      const documents = await pack.getDocuments();
+      for (const doc of documents) {
+        // Index character, npc, and monster actor types
+        if (!['character', 'npc', 'monster'].includes(doc.type)) continue;
+
+        try {
+          const system = (doc as any).system ?? {};
+          const stats = system.stats ?? {};
+          const attrMap: Record<string, { value: number; mod: number }> = {};
+
+          for (const [k, v] of Object.entries(stats)) {
+            const val = typeof v === 'object' ? ((v as any).value ?? 10) : (v as number);
+            const mod =
+              typeof v === 'object' && (v as any).mod !== undefined
+                ? (v as any).mod
+                : this.calcWWNMod(val);
+            attrMap[k.toUpperCase()] = { value: val, mod };
+          }
+
+          const hitPoints = system.health?.max ?? system.health?.value ?? undefined;
+          const armorClass = typeof system.ac === 'object' ? system.ac.value : system.ac;
+          const hitDice = system.hitDice ?? system.hd ?? undefined;
+
+          // Check for magic items
+          const items: any[] = Array.isArray((doc as any).items) ? (doc as any).items : [];
+          const hasMagic = items.some(
+            (item: any) =>
+              item.type === 'spell' ||
+              item.type === 'art' ||
+              item.type === 'gift' ||
+              (item.type === 'skill' &&
+                ['cast', 'magic', 'pray'].includes(item.name?.toLowerCase()))
+          );
+
+          const tags: string[] = system.tags || [];
+
+          creatures.push({
+            id: doc.id,
+            name: doc.name,
+            type: doc.type,
+            pack: pack.collection,
+            packLabel: pack.metadata?.label ?? pack.collection,
+            hitDice,
+            hitPoints,
+            armorClass,
+            hasMagic,
+            attributes: attrMap,
+            tags,
             img: (doc as any).img,
           });
         } catch {
@@ -3269,8 +3598,10 @@ export class FoundryDataAccess {
       );
 
       // Sort by power level then name for consistent ordering (system-aware).
-      // Power-level dial: tier (cosmere), level (pf2e), challengeRating (dnd5e).
+      // Power-level dial: hitDice (swnr/wwn), hits (mgt2e), tier (cosmere), level (pf2e), challengeRating (dnd5e).
       const powerLevel = (c: EnhancedCreatureIndex): number => {
+        if ('hasPsionics' in c && 'hitDice' in c) return (c as SWNRCreatureIndex).hitDice ?? 0;
+        if ('hasMagic' in c && 'hitDice' in c) return (c as WWNCreatureIndex).hitDice ?? 0;
         if ('hits' in c && 'hasPsionics' in c) return (c as MGT2eCreatureIndex).hits;
         if ('tier' in c) return (c as CosmereRpgCreatureIndex).tier;
         if ('level' in c) return (c as PF2eCreatureIndex).level;
@@ -3290,9 +3621,11 @@ export class FoundryDataAccess {
 
       // Convert enhanced creatures to result format (system-aware)
       const results = filteredCreatures.map(creature => {
-        const isMGT2e = 'hits' in creature && 'hasPsionics' in creature;
-        const isCosmere = !isMGT2e && 'tier' in creature;
-        const isPF2e = !isMGT2e && !isCosmere && 'level' in creature;
+        const isSWNR = 'hasPsionics' in creature && 'hitDice' in creature;
+        const isWWN = 'hasMagic' in creature && 'hitDice' in creature;
+        const isMGT2e = 'hits' in creature && 'hasPsionics' in creature && !isSWNR;
+        const isCosmere = !isMGT2e && !isSWNR && !isWWN && 'tier' in creature;
+        const isPF2e = !isMGT2e && !isSWNR && !isWWN && !isCosmere && 'level' in creature;
 
         const base = {
           id: creature.id,
@@ -3306,6 +3639,32 @@ export class FoundryDataAccess {
           size: (creature as any).size,
           hitPoints: (creature as any).hitPoints,
         };
+
+        if (isSWNR) {
+          const s = creature as SWNRCreatureIndex;
+          return {
+            ...base,
+            hitDice: s.hitDice,
+            armorClass: s.armorClass,
+            hasPsionics: s.hasPsionics,
+            attributes: s.attributes,
+            tags: s.tags,
+            summary: `HD ${s.hitDice ?? '?'} ${s.type}${s.hasPsionics ? ' (psionic)' : ''} — HP ${s.hitPoints ?? '?'}, AC ${s.armorClass ?? '?'} from ${s.packLabel}`,
+          };
+        }
+
+        if (isWWN) {
+          const w = creature as WWNCreatureIndex;
+          return {
+            ...base,
+            hitDice: w.hitDice,
+            armorClass: w.armorClass,
+            hasMagic: w.hasMagic,
+            attributes: w.attributes,
+            tags: w.tags,
+            summary: `HD ${w.hitDice ?? '?'} ${w.type}${w.hasMagic ? ' (spellcaster)' : ''} — HP ${w.hitPoints ?? '?'}, AC ${w.armorClass ?? '?'} from ${w.packLabel}`,
+          };
+        }
 
         if (isMGT2e) {
           const m = creature as MGT2eCreatureIndex;
@@ -3418,6 +3777,15 @@ export class FoundryDataAccess {
    * narrowest signal), then pf2e, then fall through to dnd5e.
    */
   private passesEnhancedCriteria(creature: EnhancedCreatureIndex, criteria: any): boolean {
+    // Check for SWNR (hasPsionics + hitDice/hitPoints pattern)
+    if ('hasPsionics' in creature && 'hitDice' in creature) {
+      return this.passesSWNRCriteria(creature as SWNRCreatureIndex, criteria);
+    }
+    // Check for WWN (hasMagic + hitDice/hitPoints pattern)
+    if ('hasMagic' in creature && 'hitDice' in creature) {
+      return this.passesWWNCriteria(creature as WWNCreatureIndex, criteria);
+    }
+    // Check for MGT2e (hits + hasPsionics pattern)
     if ('hits' in creature && 'hasPsionics' in creature) {
       return this.passesMGT2eCriteria(creature as MGT2eCreatureIndex, criteria);
     }
@@ -3427,7 +3795,8 @@ export class FoundryDataAccess {
     if ('level' in creature) {
       return this.passesPF2eCriteria(creature, criteria);
     }
-    return this.passesDnD5eCriteria(creature, criteria);
+    // Default to DnD5e for remaining creatures
+    return this.passesDnD5eCriteria(creature as DnD5eCreatureIndex, criteria);
   }
 
   /**
@@ -3440,6 +3809,93 @@ export class FoundryDataAccess {
       return false;
     if (criteria.creatureType && creature.creatureType !== criteria.creatureType) return false;
     if (criteria.actorType && creature.type !== criteria.actorType) return false;
+    return true;
+  }
+
+  /**
+   * SWNR criteria filter — hitDice range, hitPoints range, armorClass range, hasPsionics, tags.
+   */
+  private passesSWNRCriteria(creature: SWNRCreatureIndex, criteria: any): boolean {
+    // Hit Dice range
+    if (criteria.hitDice) {
+      const hd = creature.hitDice;
+      if (hd === undefined) return false;
+      if (criteria.hitDice.min !== undefined && hd < criteria.hitDice.min) return false;
+      if (criteria.hitDice.max !== undefined && hd > criteria.hitDice.max) return false;
+    }
+    // Hit Points range
+    if (criteria.minHitPoints !== undefined) {
+      const hp = creature.hitPoints;
+      if (hp === undefined || hp < criteria.minHitPoints) return false;
+    }
+    if (criteria.maxHitPoints !== undefined) {
+      const hp = creature.hitPoints;
+      if (hp === undefined || hp > criteria.maxHitPoints) return false;
+    }
+    // Armor Class range
+    if (criteria.minArmorClass !== undefined) {
+      const ac = creature.armorClass;
+      if (ac === undefined || ac < criteria.minArmorClass) return false;
+    }
+    if (criteria.maxArmorClass !== undefined) {
+      const ac = creature.armorClass;
+      if (ac === undefined || ac > criteria.maxArmorClass) return false;
+    }
+    // Psionics flag
+    if (criteria.hasPsionics !== undefined && creature.hasPsionics !== criteria.hasPsionics)
+      return false;
+    // Tags (all must be present)
+    if (criteria.tags && Array.isArray(criteria.tags)) {
+      const creatureTags = creature.tags || [];
+      for (const tag of criteria.tags) {
+        if (!creatureTags.some((t: string) => t.toLowerCase().includes(tag.toLowerCase()))) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  /**
+   * WWN criteria filter — hitDice range, hitPoints range, armorClass range, hasMagic, tags.
+   */
+  private passesWWNCriteria(creature: WWNCreatureIndex, criteria: any): boolean {
+    // Hit Dice range
+    if (criteria.hitDice) {
+      const hd = creature.hitDice;
+      if (hd === undefined) return false;
+      if (criteria.hitDice.min !== undefined && hd < criteria.hitDice.min) return false;
+      if (criteria.hitDice.max !== undefined && hd > criteria.hitDice.max) return false;
+    }
+    // Hit Points range
+    if (criteria.minHitPoints !== undefined) {
+      const hp = creature.hitPoints;
+      if (hp === undefined || hp < criteria.minHitPoints) return false;
+    }
+    if (criteria.maxHitPoints !== undefined) {
+      const hp = creature.hitPoints;
+      if (hp === undefined || hp > criteria.maxHitPoints) return false;
+    }
+    // Armor Class range
+    if (criteria.minArmorClass !== undefined) {
+      const ac = creature.armorClass;
+      if (ac === undefined || ac < criteria.minArmorClass) return false;
+    }
+    if (criteria.maxArmorClass !== undefined) {
+      const ac = creature.armorClass;
+      if (ac === undefined || ac > criteria.maxArmorClass) return false;
+    }
+    // Magic flag
+    if (criteria.hasMagic !== undefined && creature.hasMagic !== criteria.hasMagic) return false;
+    // Tags (all must be present)
+    if (criteria.tags && Array.isArray(criteria.tags)) {
+      const creatureTags = creature.tags || [];
+      for (const tag of criteria.tags) {
+        if (!creatureTags.some((t: string) => t.toLowerCase().includes(tag.toLowerCase()))) {
+          return false;
+        }
+      }
+    }
     return true;
   }
 
