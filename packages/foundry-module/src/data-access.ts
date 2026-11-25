@@ -395,7 +395,8 @@ interface ItemTargetingResult {
  */
 class PersistentCreatureIndex {
   private moduleId: string = MODULE_ID;
-  private readonly INDEX_VERSION = '1.0.0';
+  // Bumped when the indexed fields change, so stale saved indexes are rebuilt.
+  private readonly INDEX_VERSION = '1.1.0';
   private readonly INDEX_FILENAME = 'enhanced-creature-index.json';
   private buildInProgress = false;
   private hooksRegistered = false;
@@ -1577,7 +1578,8 @@ class PersistentCreatureIndex {
   // ─── SWNR index builder ─────────────────────────────────────────────────────
 
   private calcSWNRMod(value: number): number {
-    return Math.floor((value - 10) / 2);
+    // Without Number table: 3 = -2, 4-7 = -1, 8-13 = 0, 14-17 = +1, 18 = +2.
+    return value <= 3 ? -2 : value <= 7 ? -1 : value <= 13 ? 0 : value <= 17 ? 1 : 2;
   }
 
   private async buildSWNRIndex(_force = false): Promise<SWNRCreatureIndex[]> {
@@ -1668,7 +1670,10 @@ class PersistentCreatureIndex {
           const attrMap: Record<string, { value: number; mod: number }> = {};
 
           for (const [k, v] of Object.entries(stats)) {
-            const val = typeof v === 'object' ? ((v as any).value ?? 10) : (v as number);
+            const val =
+              typeof v === 'object'
+                ? ((v as any).total ?? (v as any).value ?? (v as any).base ?? 10)
+                : (v as number);
             const mod =
               typeof v === 'object' && (v as any).mod !== undefined
                 ? (v as any).mod
@@ -1726,7 +1731,8 @@ class PersistentCreatureIndex {
   // ─── WWN index builder ──────────────────────────────────────────────────────
 
   private calcWWNMod(value: number): number {
-    return Math.floor((value - 10) / 2);
+    // Without Number table: 3 = -2, 4-7 = -1, 8-13 = 0, 14-17 = +1, 18 = +2.
+    return value <= 3 ? -2 : value <= 7 ? -1 : value <= 13 ? 0 : value <= 17 ? 1 : 2;
   }
 
   private async buildWWNIndex(_force = false): Promise<WWNCreatureIndex[]> {
@@ -1813,7 +1819,7 @@ class PersistentCreatureIndex {
 
         try {
           const system = (doc as any).system ?? {};
-          const stats = system.stats ?? {};
+          const stats = system.scores ?? system.stats ?? {};
           const attrMap: Record<string, { value: number; mod: number }> = {};
 
           for (const [k, v] of Object.entries(stats)) {
@@ -1825,20 +1831,26 @@ class PersistentCreatureIndex {
             attrMap[k.toUpperCase()] = { value: val, mod };
           }
 
-          const hitPoints = system.health?.max ?? system.health?.value ?? undefined;
-          const armorClass = typeof system.ac === 'object' ? system.ac.value : system.ac;
-          const hitDice = system.hitDice ?? system.hd ?? undefined;
+          // The wwn system keeps hit points and hit dice in system.hp, and
+          // ascending armor class in system.aac.
+          const hpData = system.hp ?? system.health ?? {};
+          const hitPoints = hpData.max ?? hpData.value ?? undefined;
+          const aac = typeof system.aac === 'object' ? system.aac?.value : system.aac;
+          const armorClass = aac ?? (typeof system.ac === 'object' ? system.ac.value : system.ac);
+          const hitDice = hpData.hd ?? system.hitDice ?? system.hd ?? undefined;
 
           // Check for magic items
           const items: any[] = Array.isArray((doc as any).items) ? (doc as any).items : [];
-          const hasMagic = items.some(
-            (item: any) =>
-              item.type === 'spell' ||
-              item.type === 'art' ||
-              item.type === 'gift' ||
-              (item.type === 'skill' &&
-                ['cast', 'magic', 'pray'].includes(item.name?.toLowerCase()))
-          );
+          const hasMagic =
+            system.spells?.enabled === true ||
+            items.some(
+              (item: any) =>
+                item.type === 'spell' ||
+                item.type === 'art' ||
+                item.type === 'gift' ||
+                (item.type === 'skill' &&
+                  ['cast', 'magic', 'pray'].includes(item.name?.toLowerCase()))
+            );
 
           const tags: string[] = system.tags || [];
 
@@ -3816,10 +3828,11 @@ export class FoundryDataAccess {
    * SWNR criteria filter — hitDice range, hitPoints range, armorClass range, hasPsionics, tags.
    */
   private passesSWNRCriteria(creature: SWNRCreatureIndex, criteria: any): boolean {
-    // Hit Dice range
+    if (criteria.actorType && creature.type !== criteria.actorType) return false;
+    // Hit Dice range. Stored as text ("6", "10d8"); compare on the leading number.
     if (criteria.hitDice) {
-      const hd = creature.hitDice;
-      if (hd === undefined) return false;
+      const hd = parseInt(String(creature.hitDice ?? ''), 10);
+      if (Number.isNaN(hd)) return false;
       if (criteria.hitDice.min !== undefined && hd < criteria.hitDice.min) return false;
       if (criteria.hitDice.max !== undefined && hd > criteria.hitDice.max) return false;
     }
@@ -3860,10 +3873,11 @@ export class FoundryDataAccess {
    * WWN criteria filter — hitDice range, hitPoints range, armorClass range, hasMagic, tags.
    */
   private passesWWNCriteria(creature: WWNCreatureIndex, criteria: any): boolean {
-    // Hit Dice range
+    if (criteria.actorType && creature.type !== criteria.actorType) return false;
+    // Hit Dice range. May be stored as text ("6", "10d8"); compare on the leading number.
     if (criteria.hitDice) {
-      const hd = creature.hitDice;
-      if (hd === undefined) return false;
+      const hd = parseInt(String(creature.hitDice ?? ''), 10);
+      if (Number.isNaN(hd)) return false;
       if (criteria.hitDice.min !== undefined && hd < criteria.hitDice.min) return false;
       if (criteria.hitDice.max !== undefined && hd > criteria.hitDice.max) return false;
     }
@@ -7999,9 +8013,14 @@ export class FoundryDataAccess {
         throw new Error(`Actor not found: ${data.actorIdentifier}`);
       }
       [token] = (actor.getActiveTokens(false, false) as any[]) || [];
-    } else {
-      throw new Error('Either actorIdentifier or tokenId is required');
+    } else if (!data.chatLog && !data.whisperTo?.length) {
+      throw new Error(
+        'Either actorIdentifier or tokenId is required for a speech bubble. ' +
+          'Pass chatLog: true to post to the chat log as the Gamemaster instead.'
+      );
     }
+    // With no speaker and chatLog (or a whisper), the message is posted as the GM: narration.
+    const narration = !actor && !token;
 
     // Two shapes of the same token are needed below and they are not interchangeable:
     // bubbles.broadcast() wants the placeable, while ChatMessage.getSpeaker() must get the
@@ -8055,13 +8074,19 @@ export class FoundryDataAccess {
       };
     }
 
-    const messageData: Record<string, any> = {
-      content,
-      speaker: tokenDoc
-        ? ChatMessage.getSpeaker({ token: tokenDoc, actor })
-        : ChatMessage.getSpeaker({ actor }),
-      style: (CONST as any).CHAT_MESSAGE_STYLES?.IC ?? (CONST as any).CHAT_MESSAGE_TYPES?.IC,
-    };
+    const messageData: Record<string, any> = narration
+      ? {
+          content,
+          speaker: { alias: (game.user as any)?.name ?? 'Gamemaster' },
+          style: (CONST as any).CHAT_MESSAGE_STYLES?.OOC ?? (CONST as any).CHAT_MESSAGE_TYPES?.OOC,
+        }
+      : {
+          content,
+          speaker: tokenDoc
+            ? ChatMessage.getSpeaker({ token: tokenDoc, actor })
+            : ChatMessage.getSpeaker({ actor }),
+          style: (CONST as any).CHAT_MESSAGE_STYLES?.IC ?? (CONST as any).CHAT_MESSAGE_TYPES?.IC,
+        };
 
     if (applyPolyglot) {
       messageData.flags = { polyglot: { language: data.language } };
@@ -8075,7 +8100,7 @@ export class FoundryDataAccess {
     // the message's language flag. A whisper stays out of that mode, so it gets no bubble.
     const chatMessage = await ChatMessage.create(
       messageData,
-      (whisperIds.length > 0 ? {} : { messageMode: 'ic' }) as any
+      (whisperIds.length > 0 || narration ? {} : { messageMode: 'ic' }) as any
     );
 
     return {
@@ -8406,9 +8431,10 @@ export class FoundryDataAccess {
         success: true,
         sceneId: targetScene.id,
         sceneName: targetScene.name,
+        // The scene's own size; scene.dimensions includes the padding around it.
         dimensions: {
-          width: (targetScene.dimensions as any)?.width || (targetScene as any).width || 0,
-          height: (targetScene.dimensions as any)?.height || (targetScene as any).height || 0,
+          width: (targetScene as any).width || (targetScene.dimensions as any)?.sceneWidth || 0,
+          height: (targetScene as any).height || (targetScene.dimensions as any)?.sceneHeight || 0,
         },
       };
     } catch (error) {
@@ -9138,7 +9164,10 @@ export class FoundryDataAccess {
         y: token.y,
         width: token.width,
         height: token.height,
-        rotation: token.rotation,
+        // The prepared value trails the stored one until the canvas finishes
+        // animating, which never happens in a hidden tab; report what is stored.
+        rotation: token._source?.rotation ?? token.rotation,
+        conditions: Array.from((token.actor?.statuses as Set<string> | undefined) ?? []),
         scale: token.texture?.scaleX || 1,
         alpha: token.alpha,
         hidden: token.hidden,

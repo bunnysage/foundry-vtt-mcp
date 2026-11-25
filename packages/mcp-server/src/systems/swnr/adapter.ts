@@ -152,70 +152,101 @@ export class SWNRAdapter implements SystemAdapter {
   extractCharacterStats(actorData: any): any {
     const system = actorData.system || {};
     const stats: any = {};
+    const num = (v: unknown): number | undefined =>
+      typeof v === 'number' && Number.isFinite(v) ? v : undefined;
 
     // ── Attributes ───────────────────────────────────────────────────────────
-    // SWNR stores attributes in system.stats (str, dex, con, int, wis, cha)
-    // Each attribute has a base value and potentially a modifier
+    // system.stats.<attr> is { base, bonus, boost, temp }; the system derives
+    // total and mod when the actor is prepared. Older data used { value, mod }.
     if (system.stats && Object.keys(system.stats).length > 0) {
       stats.attributes = {};
       for (const [key, attrData] of Object.entries(system.stats)) {
         const a = attrData as any;
-        const value: number = typeof a === 'number' ? a : (a.value ?? a.base ?? 10);
-        const mod: number = typeof a === 'object' && a.mod !== undefined ? a.mod : calcMod(value);
-
         const names = ATTRIBUTE_NAMES[key.toLowerCase()];
         if (!names) continue;
-
-        stats.attributes[names.short] = {
-          value,
-          mod,
-          full: names.full,
-        };
+        const value: number = typeof a === 'number' ? a : (a?.total ?? a?.value ?? a?.base ?? 10);
+        const mod: number = typeof a === 'object' && a?.mod !== undefined ? a.mod : calcMod(value);
+        stats.attributes[names.short] = { value, mod, full: names.full };
       }
     }
 
     // ── Health ───────────────────────────────────────────────────────────────
     if (system.health) {
-      stats.health = {
-        value: system.health.value ?? 0,
-        max: system.health.max ?? 0,
-      };
+      stats.health = { value: system.health.value ?? 0, max: system.health.max ?? 0 };
     }
 
     // ── Armor Class ──────────────────────────────────────────────────────────
-    if (system.ac !== undefined) {
-      const ac = typeof system.ac === 'object' ? system.ac.value : system.ac;
-      stats.armorClass = ac;
+    // `ac` is derived from readied armor; `baseAc` is the stored unarmored value.
+    const ac = typeof system.ac === 'object' ? system.ac?.value : system.ac;
+    const armorClass = num(ac) ?? num(system.baseAc);
+    if (armorClass !== undefined) stats.armorClass = armorClass;
+    if (num(system.meleeAc) !== undefined && system.meleeAc !== armorClass) {
+      stats.meleeArmorClass = system.meleeAc;
     }
 
-    // ── Level ────────────────────────────────────────────────────────────────
-    if (system.level !== undefined) {
-      stats.level = system.level;
+    // ── Attack bonus and saves ───────────────────────────────────────────────
+    if (num(system.ab) !== undefined) stats.attackBonus = system.ab;
+    if (system.save && typeof system.save === 'object') {
+      // Characters: one target per save.
+      stats.saves = {
+        physical: system.save.physical,
+        evasion: system.save.evasion,
+        mental: system.save.mental,
+        luck: system.save.luck,
+      };
+    } else if (num(system.saves) !== undefined) {
+      // NPCs: a single save target for everything.
+      stats.saves = { all: system.saves };
     }
 
-    // ── Hit Dice (for NPCs/creatures) ────────────────────────────────────────
-    if (system.hitDice !== undefined) {
-      stats.hitDice = system.hitDice;
+    // ── Level / Hit Dice ─────────────────────────────────────────────────────
+    if (system.level !== undefined) stats.level = system.level;
+    if (system.hitDice !== undefined && system.hitDice !== '') stats.hitDice = system.hitDice;
+    if (system.hitDie) stats.hitDie = system.hitDie;
+
+    // ── NPC combat line ──────────────────────────────────────────────────────
+    if (num(system.skillBonus) !== undefined) stats.skillBonus = system.skillBonus;
+    if (num(system.moralScore) !== undefined) stats.morale = system.moralScore;
+    if (system.attacks && typeof system.attacks === 'object') {
+      stats.attacks = {
+        number: system.attacks.number,
+        damage: system.attacks.damage,
+        bonusDamage: system.attacks.bonusDamage,
+      };
     }
+    if (num(system.speed) !== undefined) stats.speed = system.speed;
 
     // ── Skills ───────────────────────────────────────────────────────────────
-    // SWNR skills can be on the actor directly or as skill items
-    // Check for skills in system.skills first, then fall back to items
-    if (system.skills && Object.keys(system.skills).length > 0) {
+    // Skills are owned items of type "skill" with system.rank (-1 untrained to 4).
+    const skillItems = (actorData.items || []).filter((i: any) => i?.type === 'skill');
+    if (skillItems.length > 0) {
+      stats.skills = {};
+      for (const item of skillItems) {
+        const rank = item.system?.rank;
+        stats.skills[item.name] = { rank: typeof rank === 'number' ? rank : -1 };
+      }
+    } else if (system.skills && Object.keys(system.skills).length > 0) {
       stats.skills = {};
       for (const [key, skillData] of Object.entries(system.skills)) {
-        const s = skillData as any;
-        const rank: number = typeof s === 'number' ? s : (s.rank ?? s.value ?? -1);
-        stats.skills[key] = { rank };
+        const sk = skillData as any;
+        stats.skills[key] = { rank: typeof sk === 'number' ? sk : (sk.rank ?? sk.value ?? -1) };
       }
     }
 
-    // ── System Strain (optional subsystem) ───────────────────────────────────
+    // ── System Strain ────────────────────────────────────────────────────────
     if (system.systemStrain) {
       stats.systemStrain = {
         value: system.systemStrain.value ?? 0,
-        max: system.systemStrain.max ?? 0,
+        ...(system.systemStrain.permanent ? { permanent: system.systemStrain.permanent } : {}),
+        ...(system.systemStrain.max !== undefined ? { max: system.systemStrain.max } : {}),
       };
+    }
+
+    // ── Ships ────────────────────────────────────────────────────────────────
+    if (actorData.type === ACTOR_TYPES.SHIP) {
+      for (const key of ['armor', 'speed', 'crew', 'power', 'mass', 'hardpoints', 'spikeDrive']) {
+        if (system[key] !== undefined) stats[key] = system[key];
+      }
     }
 
     return stats;
@@ -226,7 +257,7 @@ export class SWNRAdapter implements SystemAdapter {
    *
    * SWNR field paths by actor type:
    * - character/npc: system.class, system.background, system.homeworld, system.species
-   * - ship: system.shipClass, system.hullType, system.power, system.mass
+   * - ship: system.shipClass, system.shipHullType, system.power, system.mass
    * - faction: system.wealth, system.force, system.cunning
    */
   extractBasicInfo(actorData: any): any {
@@ -239,10 +270,12 @@ export class SWNRAdapter implements SystemAdapter {
       if (system.background) basicInfo.background = system.background;
       if (system.homeworld) basicInfo.homeworld = system.homeworld;
       if (system.species) basicInfo.species = system.species;
+      if (system.employer) basicInfo.employer = system.employer;
       if (system.level !== undefined) basicInfo.level = system.level;
     } else if (actorType === ACTOR_TYPES.SHIP) {
       if (system.shipClass) basicInfo.shipClass = system.shipClass;
-      if (system.hullType) basicInfo.hullType = system.hullType;
+      const hull = system.shipHullType ?? system.hullType;
+      if (hull) basicInfo.hullType = hull;
       if (system.power !== undefined) basicInfo.power = system.power;
       if (system.mass !== undefined) basicInfo.mass = system.mass;
       if (system.hardpoints !== undefined) basicInfo.hardpoints = system.hardpoints;
@@ -259,82 +292,98 @@ export class SWNRAdapter implements SystemAdapter {
 
   describeActorSchema(): string {
     return [
-      '=== SWNR Actor Schema Reference ===',
+      '=== Stars Without Number (swnr system) Actor Schema Reference ===',
       '',
-      'ACTOR TYPES: character, npc, ship, faction, drone, vehicle',
+      'ACTOR TYPES: character, npc, ship, mech, vehicle, drone, cyberdeck, faction',
       '',
-      'ATTRIBUTES (character/npc) — system.stats:',
-      '  Full:      { str:{value:14,mod:2}, dex:{value:12,mod:1}, ... }',
-      '  Shorthand: { str:14, dex:12, con:10, int:13, wis:11, cha:9 }  (mod auto-calculated)',
-      '  Modifier formula: floor((value - 10) / 2)',
+      'ATTRIBUTES (character only) — system.stats.<str|dex|con|int|wis|cha>:',
+      '  Stored:    { base: 14, bonus: 0, boost: 0, temp: 0 }   (set "base")',
+      '  Shorthand accepted here: { str: 14, dex: 12, ... } is written as base.',
+      '  The system derives total and mod itself. Modifiers: 3 = -2, 4-7 = -1,',
+      '  8-13 = 0, 14-17 = +1, 18 = +2. Do not write mod.',
       '',
-      'SKILLS (character/npc):',
-      '  Can be in system.skills or as skill items',
-      '  Rank range: -1 (untrained), 0, 1, 2, 3, 4',
-      '  Common skills: administer, connect, exert, fix, heal, know, lead, notice, perform,',
-      '    pilot, program, punch, sail, shoot, sneak, stab, survive, talk, trade, work',
-      '  Psionic skills: biopsionics, metapsionics, precognition, telekinesis, telepathy, teleportation',
+      'HEALTH — system.health: { value: 20, max: 20 }',
+      'ARMOR CLASS — system.baseAc (unarmored, default 10). system.ac is derived from',
+      '  readied armor and cannot be written. system.meleeAc is the melee AC.',
+      'ATTACK BONUS — system.ab (and system.meleeAb).',
+      'SYSTEM STRAIN — system.systemStrain: { value, permanent }',
       '',
-      'HEALTH — system.health:',
-      '  { value: 20, max: 20 }',
+      'CHARACTER:',
+      '  system.level: { value: 3, exp: 0 }      system.hitDie: "d6"',
+      '  system.class, system.background, system.homeworld, system.species, system.employer',
+      '  system.credits: { balance, debt, owed }',
+      '  Saves (physical, evasion, mental, luck) are derived from level and attributes.',
       '',
-      'ARMOR CLASS — system.ac:',
-      '  Can be number or { value: 15 }',
+      'NPC (flat stat line, no attributes):',
+      '  system.hitDice: "3"          system.health: { value, max }',
+      '  system.baseAc: 13            system.ab: 4',
+      '  system.saves: 13  (one target for every save)',
+      '  system.skillBonus: 1         system.moralScore: 8        system.speed: 10',
+      '  system.attacks: { number: 1, damage: "d8", bonusDamage: 0 }',
       '',
-      'LEVEL — system.level:',
-      '  Character/NPC level (1-10 typical)',
+      'SKILLS are owned items of type "skill": system.rank from -1 (untrained) to 4,',
+      '  system.defaultStat (e.g. "dex"), system.source ("Core" or "Psionic").',
+      '  Core: Administer, Connect, Exert, Fix, Heal, Know, Lead, Notice, Perform, Pilot,',
+      '  Program, Punch, Shoot, Sneak, Stab, Survive, Talk, Trade, Work.',
+      '  Psychic: Biopsionics, Metapsionics, Precognition, Telekinesis, Telepathy, Teleportation.',
       '',
-      'HIT DICE — system.hitDice:',
-      '  For NPCs/creatures; primary power-level indicator',
+      'SHIP — system.health {value,max}, system.ac, system.armor, system.speed,',
+      '  system.crew {min,max,current}, system.power {value,max}, system.mass {value,max},',
+      '  system.hardpoints {value,max}, system.shipClass, system.shipHullType, system.spikeDrive.',
       '',
-      'CHARACTER DETAILS:',
-      '  system.class: "Expert", "Warrior", "Psychic", etc.',
-      '  system.background: Character background',
-      '  system.homeworld: Home planet/location',
-      '  system.species: Species/ancestry',
-      '',
-      'SHIP FIELDS (ship actors):',
-      '  system.shipClass: Ship class name',
-      '  system.hullType: Hull type',
-      '  system.health: { value, max } — hull points',
-      '  system.armorClass: Ship AC',
-      '  system.power: { value, max } — power units',
-      '  system.mass: { value, max } — mass units',
-      '  system.hardpoints: { value, max } — weapon hardpoints',
-      '',
-      'FACTION FIELDS (faction actors):',
-      '  system.health: { value, max } — faction hit points',
-      '  system.wealth: Wealth rating',
-      '  system.force: Force rating',
-      '  system.cunning: Cunning rating',
-      '  system.tag: Faction tag',
-      '',
-      'ITEM TYPES:',
-      '  character/npc: weapon, armor, item (gear), focus, edge, skill, power (psionic), cyberware',
-      '  ship: shipWeapon, shipFitting, shipDefense',
+      'ITEM TYPES: weapon, armor, item (gear), skill, power (psychic or other; system.subType),',
+      '  feature (foci, edges, class abilities; system.type is "focus", "edge", ...), cyberware,',
+      '  asset (faction), program, injury, shipWeapon, shipDefense, shipFitting.',
+      '  weapon: system.damage "1d8", system.ab, system.stat "dex", system.range {normal,max},',
+      '    system.shock {dmg, ac}, system.ammo {type,max,value}, system.isMelee.',
+      '  armor: system.ac, system.meleeAc, system.shield, system.use (true = readied/worn).',
     ].join('\n');
   }
 
-  normalizePayload(system: Record<string, any>): Record<string, any> {
+  normalizePayload(system: Record<string, any>, actorType?: string): Record<string, any> {
     const normalized = { ...system };
+    // Ships, mechs, vehicles and drones store a real `ac`; people store `baseAc`.
+    // On an update the type is unknown, so fall back to what the payload looks like.
+    const person = actorType
+      ? actorType === ACTOR_TYPES.CHARACTER || actorType === ACTOR_TYPES.NPC
+      : !['shipClass', 'shipHullType', 'armor', 'crew', 'spikeDrive', 'hardpoints', 'mass'].some(
+          key => key in normalized
+        );
 
-    // Normalize attributes shorthand
-    if (normalized.stats) {
-      const stats = normalized.stats;
+    // Attributes are stored as { base }. Accept the shorthand number and the
+    // older { value, mod } shape, and never write the derived fields.
+    if (normalized.stats && typeof normalized.stats === 'object') {
+      const stats: Record<string, any> = { ...normalized.stats };
       for (const key of Object.keys(ATTRIBUTE_NAMES)) {
-        if (typeof stats[key] === 'number') {
-          const value = stats[key];
-          stats[key] = {
+        const given = stats[key];
+        if (typeof given === 'number') {
+          stats[key] = { base: given };
+        } else if (given && typeof given === 'object') {
+          const {
             value,
-            mod: calcMod(value),
-          };
+            mod: _mod,
+            total: _total,
+            baseTotal: _baseTotal,
+            label: _label,
+            ...rest
+          } = given;
+          stats[key] =
+            rest.base === undefined && typeof value === 'number' ? { ...rest, base: value } : rest;
         }
       }
+      normalized.stats = stats;
     }
 
-    // Normalize AC if it's a plain number
-    if (typeof normalized.ac === 'number') {
-      normalized.ac = { value: normalized.ac };
+    // `ac` is derived; the stored field is baseAc.
+    if (person && normalized.ac !== undefined && normalized.baseAc === undefined) {
+      const ac = typeof normalized.ac === 'object' ? normalized.ac?.value : normalized.ac;
+      if (typeof ac === 'number') normalized.baseAc = ac;
+      delete normalized.ac;
+    }
+
+    // Level is { value, exp }.
+    if (typeof normalized.level === 'number') {
+      normalized.level = { value: normalized.level };
     }
 
     return normalized;

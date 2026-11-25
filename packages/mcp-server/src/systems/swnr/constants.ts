@@ -23,7 +23,13 @@ export const ATTRIBUTE_NAMES: Record<string, { short: string; full: string }> = 
  * SWN formula: floor((value - 10) / 2)
  */
 export function calcMod(value: number): number {
-  return Math.floor((value - 10) / 2);
+  // The Without Number table, not the d20 formula: 3 is -2, 4-7 is -1,
+  // 8-13 is 0, 14-17 is +1, 18 is +2.
+  if (value <= 3) return -2;
+  if (value <= 7) return -1;
+  if (value <= 13) return 0;
+  if (value <= 17) return 1;
+  return 2;
 }
 
 /**
@@ -45,8 +51,7 @@ export const ITEM_TYPES = {
   WEAPON: 'weapon',
   ARMOR: 'armor',
   ITEM: 'item', // Generic gear/equipment
-  FOCUS: 'focus',
-  EDGE: 'edge',
+  FEATURE: 'feature', // foci, edges, class abilities (system.type says which)
   SKILL: 'skill',
   POWER: 'power', // Psionic powers
   CYBERWARE: 'cyberware',
@@ -77,10 +82,10 @@ export const FIELD_PATHS = {
   SYSTEM_STRAIN_MAX: 'system.systemStrain.max',
 
   // Armor Class
-  AC: 'system.ac.value',
+  AC: 'system.baseAc',
 
   // Level (for characters/NPCs)
-  LEVEL: 'system.level',
+  LEVEL: 'system.level.value',
 
   // Hit Dice (for NPCs/creatures)
   HIT_DICE: 'system.hitDice',
@@ -93,12 +98,12 @@ export const FIELD_PATHS = {
 
   // Ship fields
   SHIP_HP: 'system.health',
-  SHIP_AC: 'system.armorClass',
+  SHIP_AC: 'system.ac',
   SHIP_POWER: 'system.power',
   SHIP_MASS: 'system.mass',
   SHIP_HARDPOINTS: 'system.hardpoints',
   SHIP_CLASS: 'system.shipClass',
-  SHIP_HULL_TYPE: 'system.hullType',
+  SHIP_HULL_TYPE: 'system.shipHullType',
 
   // Faction fields
   FACTION_HP: 'system.health',

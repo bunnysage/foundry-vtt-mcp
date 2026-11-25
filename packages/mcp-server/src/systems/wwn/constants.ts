@@ -23,7 +23,13 @@ export const ATTRIBUTE_NAMES: Record<string, { short: string; full: string }> = 
  * WWN formula: floor((value - 10) / 2)
  */
 export function calcMod(value: number): number {
-  return Math.floor((value - 10) / 2);
+  // The Without Number table, not the d20 formula: 3 is -2, 4-7 is -1,
+  // 8-13 is 0, 14-17 is +1, 18 is +2.
+  if (value <= 3) return -2;
+  if (value <= 7) return -1;
+  if (value <= 13) return 0;
+  if (value <= 17) return 1;
+  return 2;
 }
 
 /**

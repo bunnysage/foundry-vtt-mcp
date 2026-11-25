@@ -24,7 +24,8 @@ export class ChatTools {
           'Speak an in-character line as an actor or a specific token: a floating speech ' +
           'bubble over the token (the default), a real chat-log message, or a whisper to ' +
           'named players. Pass a language to have Polyglot scramble a chat-log message for ' +
-          "viewers who don't know it. One call posts one line. Requires Allow Write " +
+          "viewers who don't know it. With no actor or token and chatLog: true, the line is " +
+          'posted to the chat log as the Gamemaster (narration). One call posts one line. Requires Allow Write ' +
           'Operations in the bridge module settings.',
         inputSchema: {
           type: 'object',
@@ -91,8 +92,9 @@ export class ChatTools {
         chatLog: z.boolean().optional(),
         whisperTo: z.array(z.string()).optional(),
       })
-      .refine(v => v.actorIdentifier || v.tokenId, {
-        message: 'Either actorIdentifier or tokenId is required',
+      .refine(v => v.actorIdentifier || v.tokenId || v.chatLog || v.whisperTo?.length, {
+        message:
+          'Either actorIdentifier or tokenId is required for a speech bubble. Pass chatLog: true to post to the chat log as the Gamemaster (narration).',
       });
 
     const parsed = schema.parse(args);

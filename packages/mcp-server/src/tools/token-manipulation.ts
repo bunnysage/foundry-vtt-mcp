@@ -340,6 +340,7 @@ export class TokenManipulationTools {
         hidden: tokenData.hidden,
         img: tokenData.img,
       },
+      conditions: tokenData.conditions ?? [],
       behavior: {
         disposition: this.getDispositionName(tokenData.disposition),
         elevation: tokenData.elevation,

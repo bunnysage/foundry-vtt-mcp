@@ -156,6 +156,13 @@ export class ErrorHandler {
 
     let message = `${typeEmoji} **${mcpError.message}**\n\n${recoveryText}`;
 
+    // Say what was actually wrong. Without this a bad or misnamed parameter
+    // only yields generic advice and the caller cannot correct itself.
+    if (typeof mcpError.details === 'string' && mcpError.details.trim()) {
+      const detail = mcpError.details.trim();
+      message += `\n\n**Details:** ${detail.length > 600 ? detail.slice(0, 600) + '…' : detail}`;
+    }
+
     if (mcpError.suggestions && mcpError.suggestions.length > 0) {
       message += '\n\n**Suggestions:**\n';
       message += mcpError.suggestions.map(suggestion => `• ${suggestion}`).join('\n');
