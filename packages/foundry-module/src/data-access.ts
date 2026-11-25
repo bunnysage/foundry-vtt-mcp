@@ -8343,29 +8343,88 @@ export class FoundryDataAccess {
   private async useWithoutNumberItem(
     systemId: string,
     actor: any,
-    item: any
+    item: any,
+    options: {
+      modifier?: number | undefined;
+      burst?: boolean | undefined;
+      attackMode?: string | undefined;
+      attribute?: string | undefined;
+    } = {},
+    hasTargets = false
   ): Promise<{
     rolls: Array<{ formula: string; total: number; flavor?: string }>;
     cards: string[];
+    applied: string[];
   } | null> {
     let run: (() => any) | null = null;
+    const applied: string[] = [];
+    const modifier = Number.isFinite(Number(options.modifier)) ? Number(options.modifier) : 0;
+    const attribute = String(options.attribute ?? '')
+      .toLowerCase()
+      .trim()
+      .slice(0, 3);
+    const attributes = ['str', 'dex', 'con', 'int', 'wis', 'cha'];
+    if (attribute && !attributes.includes(attribute)) {
+      throw new Error(
+        `Unknown attribute "${options.attribute}". Use one of: ${attributes.join(', ')}.`
+      );
+    }
+    if (modifier) applied.push(`modifier ${modifier > 0 ? '+' : ''}${modifier}`);
 
     if (systemId === 'wwn') {
-      if (item.type === 'weapon' && typeof actor.targetAttack === 'function') {
-        // Same data the system's own rollWeapon() builds. A weapon usable both
-        // ways is rolled as melee rather than asking which.
-        const s = item.system ?? {};
+      const s = item.system ?? {};
+      // The wwn roll code takes no extra modifier or attribute when its dialog is
+      // skipped, so adjust the prepared (in-memory) item for the length of the
+      // roll and put it back. Nothing is saved to the item.
+      const during = async (changes: Record<string, any>, roll: () => any): Promise<void> => {
+        const before: Record<string, any> = {};
+        for (const [key, value] of Object.entries(changes)) {
+          before[key] = s[key];
+          s[key] = value;
+        }
+        try {
+          await roll();
+        } finally {
+          for (const [key, value] of Object.entries(before)) s[key] = value;
+        }
+      };
+      if (item.type === 'weapon' && typeof actor.rollAttack === 'function') {
+        // Same data the system's own rollWeapon() builds.
+        const both = !!(s.missile && s.melee) && actor.type === 'character';
+        if (both && !options.attackMode) {
+          throw new Error(
+            `${item.name} can be used in melee or as a missile. Ask the GM which, then call again with attackMode "melee" or "missile".`
+          );
+        }
         const type =
-          actor.type !== 'character' ? 'attack' : s.missile && !s.melee ? 'missile' : 'melee';
+          actor.type !== 'character'
+            ? 'attack'
+            : both
+              ? options.attackMode!
+              : s.missile && !s.melee
+                ? 'missile'
+                : 'melee';
+        if (both) applied.push(type);
         const rollData = {
           ...(actor._getRollData?.() || {}),
           item,
           actor,
           roll: { save: s.save, target: null },
         };
-        run = () => actor.targetAttack(rollData, type, { skipDialog: true });
+        run = () =>
+          during(modifier ? { bonus: (Number(s.bonus) || 0) + modifier } : {}, () =>
+            hasTargets
+              ? actor.targetAttack(rollData, type, { skipDialog: true })
+              : actor.rollAttack(rollData, { type, skipDialog: true })
+          );
       } else if (item.type === 'skill' && typeof item.rollSkill === 'function') {
-        run = () => item.rollSkill({ skipDialog: true });
+        const changes: Record<string, any> = {};
+        if (modifier) changes.ownedLevel = (Number(s.ownedLevel) || 0) + modifier;
+        if (attribute) {
+          changes.score = attribute;
+          applied.push(`attribute ${attribute.toUpperCase()}`);
+        }
+        run = () => during(changes, () => item.rollSkill({ skipDialog: true }));
       }
     } else if (systemId === 'swnr') {
       const data = item.system ?? {};
@@ -8373,10 +8432,16 @@ export class FoundryDataAccess {
         if (data.hasAmmo === false) throw new Error(`${item.name} is out of ammo`);
         const isCharacter = actor.type === 'character';
         const stats = actor.system?.stats ?? {};
-        let statName = data.stat && data.stat !== 'ask' ? data.stat : 'dex';
+        let statName = attribute || (data.stat && data.stat !== 'ask' ? data.stat : '');
+        if (isCharacter && !statName) {
+          throw new Error(
+            `${item.name} has no set attribute. Ask the GM which attribute to attack with, then call again with attribute.`
+          );
+        }
         const second = data.secondStat;
         if (
           isCharacter &&
+          !attribute &&
           second &&
           second !== 'none' &&
           (stats[statName]?.mod ?? 0) < (stats[second]?.mod ?? 0)
@@ -8396,20 +8461,34 @@ export class FoundryDataAccess {
             : Number(actor.system?.skillBonus) || 0;
         }
         if (!isCharacter) damageBonus += Number(actor.system?.attacks?.bonusDamage) || 0;
-        run = () => data.rollAttack(damageBonus, statMod, skillMod, 0, false);
+        const ammo = data.ammo ?? {};
+        const canBurst = ammo.type !== 'none' && !!ammo.burst;
+        if (options.burst && !canBurst) throw new Error(`${item.name} cannot burst fire.`);
+        if (options.burst && ammo.type !== 'infinite' && (Number(ammo.value) || 0) < 3) {
+          throw new Error(`${item.name} does not have the 3 rounds a burst needs.`);
+        }
+        if (options.burst) applied.push('burst fire');
+        if (attribute) applied.push(`attribute ${attribute.toUpperCase()}`);
+        run = () => data.rollAttack(damageBonus, statMod, skillMod, modifier, !!options.burst);
       } else if (
         item.type === 'skill' &&
         actor.type === 'character' &&
-        typeof data.rollSkill === 'function' &&
-        data.defaultStat &&
-        data.defaultStat !== 'ask' &&
-        data.pool &&
-        data.pool !== 'ask'
+        typeof data.rollSkill === 'function'
       ) {
-        const stat = actor.system?.stats?.[data.defaultStat] ?? { mod: 0 };
+        const statName =
+          attribute || (data.defaultStat && data.defaultStat !== 'ask' ? data.defaultStat : '');
+        if (!statName) {
+          throw new Error(
+            `${item.name} has no default attribute. Ask the GM which attribute to roll it with, then call again with attribute.`
+          );
+        }
+        const dice = data.pool && data.pool !== 'ask' ? data.pool : '2d6';
+        const stat = actor.system?.stats?.[statName] ?? { mod: 0 };
         const short =
-          (game.i18n as any)?.localize?.(`swnr.stat.short.${data.defaultStat}`) ?? data.defaultStat;
-        run = () => data.rollSkill(item.name, short, stat.mod ?? 0, data.pool, data.rank ?? -1, 0);
+          (game.i18n as any)?.localize?.(`swnr.stat.short.${statName}`) ?? statName.toUpperCase();
+        if (attribute) applied.push(`attribute ${attribute.toUpperCase()}`);
+        run = () =>
+          data.rollSkill(item.name, short, stat.mod ?? 0, dice, data.rank ?? -1, modifier);
       }
     }
 
@@ -8457,7 +8536,7 @@ export class FoundryDataAccess {
     } finally {
       (Hooks as any).off('createChatMessage', hookId);
     }
-    return { rolls, cards };
+    return { rolls, cards, applied };
   }
 
   /**
@@ -9960,6 +10039,10 @@ export class FoundryDataAccess {
           skipDialog?: boolean | undefined; // Skip confirmation dialogs (default: true for MCP)
           spellLevel?: number | undefined; // For spells: cast at higher level
           versatile?: boolean | undefined; // For versatile weapons: use versatile damage
+          modifier?: number | undefined; // SWN/WWN: situational modifier to the roll
+          burst?: boolean | undefined; // SWN: burst fire
+          attackMode?: 'melee' | 'missile' | undefined; // WWN: weapon usable both ways
+          attribute?: string | undefined; // SWN/WWN skills: attribute to roll with
         }
       | undefined;
   }): Promise<{
@@ -10007,7 +10090,13 @@ export class FoundryDataAccess {
       // numbers instead of opening the system's roll dialog on the GM's screen.
       const direct =
         systemId === 'swnr' || systemId === 'wwn'
-          ? await this.useWithoutNumberItem(systemId, actor, itemAny)
+          ? await this.useWithoutNumberItem(
+              systemId,
+              actor,
+              itemAny,
+              options,
+              targeting.applied.length > 0
+            )
           : null;
 
       if (direct) {
@@ -10154,6 +10243,7 @@ export class FoundryDataAccess {
         result.requiresGMInteraction = false;
         result.message =
           `${actor.name} used ${item.name}${targetInfo}.${targetingWarningInfo} ` +
+          (direct.applied.length ? `With ${direct.applied.join(', ')}. ` : '') +
           (totals
             ? `Rolled without a dialog: ${totals}`
             : 'No dialog was needed; the result is in chat.');
