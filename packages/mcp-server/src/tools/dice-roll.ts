@@ -34,7 +34,7 @@ export class DiceRollTools {
             rollTarget: {
               type: 'string',
               description:
-                'Target for the roll - can be ability name (str, dex, con, int, wis, cha), skill name (perception, insight, stealth, etc.), or custom roll formula',
+                'Target for the roll - can be ability name (str, dex, con, int, wis, cha), skill name (perception, insight, stealth, etc.), or custom roll formula. Stars/Worlds Without Number: skills roll 2d6 + skill level + attribute modifier (name the attribute as "notice/wis" to override the skill default); saves are "physical", "evasion", "mental" or "luck" and roll a plain d20 against the character sheet target.',
             },
             targetPlayer: {
               type: 'string',
@@ -103,7 +103,16 @@ export class DiceRollTools {
       );
 
       if (response.success) {
-        return `Roll request sent successfully! ${response.message}`;
+        const extra = [
+          response.character
+            ? `Character: ${response.character}.`
+            : 'No character is owned by that player, so no modifiers were applied.',
+          response.formula ? `Formula: ${response.formula}.` : '',
+          response.saveTarget !== undefined ? `Succeeds on ${response.saveTarget} or higher.` : '',
+        ]
+          .filter(Boolean)
+          .join(' ');
+        return `Roll request sent successfully! ${response.message} ${extra}`.trim();
       } else {
         throw new Error(response.error || 'Failed to request player rolls');
       }

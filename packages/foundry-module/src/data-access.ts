@@ -3401,7 +3401,57 @@ export class FoundryDataAccess {
       return a.name.localeCompare(b.name);
     });
 
-    return results.slice(0, 50); // Final limit
+    const limited = results.slice(0, 50); // Final limit
+    await this.attachCreatureStats(limited);
+    return limited;
+  }
+
+  /**
+   * Add the key combat numbers to actor results of a name search, taken from the
+   * saved creature index, so a caller does not need one more request per creature.
+   * Best effort: a missing or disabled index leaves the results as they were.
+   */
+  private async attachCreatureStats(results: any[]): Promise<void> {
+    try {
+      if (!results.length) return;
+      if (!game.settings.get(this.moduleId, 'enableEnhancedCreatureIndex')) return;
+      const actorPacks = new Set(
+        Array.from(game.packs.values())
+          .filter((p: any) => p.metadata.type === 'Actor')
+          .map((p: any) => p.metadata.id)
+      );
+      if (!results.some(r => actorPacks.has(r.pack))) return;
+
+      const byKey = new Map<string, any>();
+      for (const c of await this.persistentIndex.getEnhancedIndex()) {
+        byKey.set(`${(c as any).pack}|${c.id}`, c);
+      }
+      const fields = [
+        'hitDice',
+        'hitPoints',
+        'armorClass',
+        'challengeRating',
+        'level',
+        'tier',
+        'hits',
+        'creatureType',
+        'hasPsionics',
+        'hasMagic',
+        'hasSpells',
+      ];
+      for (const r of results) {
+        const c = byKey.get(`${r.pack}|${r.id}`);
+        if (!c) continue;
+        const stats: Record<string, any> = {};
+        for (const f of fields) {
+          const v = c[f];
+          if (v !== undefined && v !== null && v !== '' && v !== false) stats[f] = v;
+        }
+        if (Object.keys(stats).length) r.stats = stats;
+      }
+    } catch (error) {
+      console.warn(`[${this.moduleId}] Could not attach creature stats to search results:`, error);
+    }
   }
 
   /**
@@ -4353,8 +4403,21 @@ export class FoundryDataAccess {
     }));
   }
 
+  /** Which scene the Gamemaster is viewing versus the one that is active for players. */
+  private describeViewedScene(scene: any): Record<string, any> {
+    const active = (game.scenes as any)?.active ?? game.scenes?.find((s: any) => s.active);
+    if (!active || active.id === scene.id) return { viewedByGM: true };
+    return {
+      viewedByGM: true,
+      activeScene: { id: active.id, name: active.name },
+      note:
+        `The Gamemaster is viewing "${scene.name}", but players are on the active scene ` +
+        `"${active.name}". Token tools act on the viewed scene. Use switch-scene to change it.`,
+    };
+  }
+
   /**
-   * Get active scene information
+   * Get the scene the Gamemaster is viewing (usually also the active scene)
    */
   async getActiveScene(): Promise<SceneInfo> {
     const scene = (game.scenes as any).current;
@@ -4376,6 +4439,9 @@ export class FoundryDataAccess {
       height: scene.height,
       padding: scene.padding,
       active: scene.active,
+      // "Current" is the scene this Gamemaster is looking at, which is where the
+      // token tools act. Players are on the active scene; say so when they differ.
+      ...this.describeViewedScene(scene),
       navigation: scene.navigation,
       tokens: scene.tokens.map((token: any) => ({
         id: token.id,
@@ -6492,7 +6558,13 @@ export class FoundryDataAccess {
 
       // Generate roll button HTML
       const buttonId = foundry.utils.randomID();
-      const buttonLabel = this.buildRollButtonLabel(data.rollType, data.rollTarget, data.isPublic);
+      let buttonLabel = this.buildRollButtonLabel(data.rollType, data.rollTarget, data.isPublic);
+      // Without Number saves succeed on the target number or higher; show it on the button.
+      const saveTarget =
+        data.rollType === 'save'
+          ? this.withoutNumberSaveTarget(data.rollTarget, playerInfo.character)
+          : undefined;
+      if (saveTarget !== undefined) buttonLabel += ` — needs ${saveTarget}+`;
 
       // Check if this type of roll was already performed (optional: could check for duplicate recent rolls)
       // For now, we'll just create the button and let the rendering logic handle the state restoration
@@ -6505,7 +6577,8 @@ export class FoundryDataAccess {
           
           <div style="text-align: center; margin-top: 8px;">
             <!-- Single Roll Button (clickable by both character owner and GM) -->
-            <button class="mcp-roll-button mcp-button-active" 
+            <button class="mcp-roll-button mcp-button-active"
+                    style="height: auto; min-height: 2rem; white-space: normal; line-height: 1.3; padding: 6px 10px;"
                     data-button-id="${buttonId}"
                     data-roll-formula="${rollFormula}"
                     data-roll-label="${buttonLabel}"
@@ -6576,7 +6649,10 @@ export class FoundryDataAccess {
       return {
         success: true,
         message: `Roll request sent to ${playerInfo.targetName}. ${data.isPublic ? 'Public roll' : 'Private roll'} button created in chat.`,
-      };
+        formula: rollFormula,
+        ...(playerInfo.character ? { character: playerInfo.character.name } : {}),
+        ...(saveTarget !== undefined ? { saveTarget } : {}),
+      } as any;
     } catch (error) {
       console.error(`[${MODULE_ID}] Error creating roll request:`, error);
       return {
@@ -6769,8 +6845,11 @@ export class FoundryDataAccess {
     character?: Actor
   ): string {
     let baseFormula = '1d20';
+    const systemId = String((game as any).system?.id ?? '');
 
-    if (character) {
+    if (character && (systemId === 'swnr' || systemId === 'wwn')) {
+      baseFormula = this.buildWithoutNumberFormula(systemId, rollType, rollTarget, character);
+    } else if (character) {
       // Use Foundry's getRollData() to get calculated modifiers including active effects
       const rollData = character.getRollData() as any; // Type assertion for Foundry's dynamic roll data
 
@@ -6809,6 +6888,10 @@ export class FoundryDataAccess {
         default:
           baseFormula = '1d20';
       }
+    } else if (rollType === 'custom') {
+      baseFormula = rollTarget;
+    } else if (rollType === 'skill' && (systemId === 'swnr' || systemId === 'wwn')) {
+      baseFormula = '2d6';
     } else {
       console.warn(`[${MODULE_ID}] No character provided for roll formula, using base 1d20`);
     }
@@ -6823,6 +6906,86 @@ export class FoundryDataAccess {
     }
 
     return baseFormula;
+  }
+
+  /** Attribute modifier of a Stars/Worlds Without Number actor ("str", "dexterity", ...). */
+  private withoutNumberMod(systemId: string, character: Actor, attribute: string): number {
+    const key = attribute.toLowerCase().trim().slice(0, 3);
+    const system = (character as any).system ?? {};
+    const mod = (systemId === 'swnr' ? system.stats : system.scores)?.[key]?.mod;
+    return typeof mod === 'number' ? mod : 0;
+  }
+
+  /** The owned skill item matching a name, and its rank (-1 when untrained or missing). */
+  private withoutNumberSkill(
+    systemId: string,
+    character: Actor,
+    name: string
+  ): { rank: number; attribute: string; dice: string } {
+    const wanted = name.toLowerCase().trim();
+    const item = ((character as any).items?.contents ?? []).find(
+      (i: any) => i.type === 'skill' && i.name?.toLowerCase() === wanted
+    );
+    const s = item?.system ?? {};
+    const rank = systemId === 'swnr' ? s.rank : s.ownedLevel;
+    return {
+      rank: typeof rank === 'number' ? rank : -1,
+      attribute: String((systemId === 'swnr' ? s.defaultStat : s.score) || ''),
+      dice: String((systemId === 'swnr' ? s.pool : s.skillDice) || '2d6').replace(/^ask$/i, '2d6'),
+    };
+  }
+
+  /**
+   * Stars / Worlds Without Number rolls. Skill checks are 2d6 + skill level +
+   * attribute modifier; saves are a plain d20 against the character's own save
+   * target; attacks are d20 + attack bonus; initiative is d8 + Dexterity.
+   * A rollTarget such as "notice/wis" names the attribute to use with the skill.
+   */
+  private buildWithoutNumberFormula(
+    systemId: string,
+    rollType: string,
+    rollTarget: string,
+    character: Actor
+  ): string {
+    const system = (character as any).system ?? {};
+    const signed = (n: number): string => (n < 0 ? `${n}` : `+${n}`);
+    switch (rollType) {
+      case 'skill': {
+        const [skillName = '', attribute = ''] = rollTarget.split(/[\/+,]/).map(p => p.trim());
+        const skill = this.withoutNumberSkill(systemId, character, skillName);
+        const mod = this.withoutNumberMod(systemId, character, attribute || skill.attribute);
+        return `${/^\d+d\d+/i.test(skill.dice) ? skill.dice : '2d6'}${signed(skill.rank)}${signed(mod)}`;
+      }
+      case 'ability':
+        return `2d6${signed(this.withoutNumberMod(systemId, character, rollTarget))}`;
+      case 'save':
+        return '1d20';
+      case 'attack': {
+        const ab = systemId === 'swnr' ? system.ab : system.thac0?.bba;
+        return `1d20${signed(typeof ab === 'number' ? ab : 0)}`;
+      }
+      case 'initiative':
+        return `1d8${signed(this.withoutNumberMod(systemId, character, 'dex'))}`;
+      case 'custom':
+        return rollTarget;
+      default:
+        return '1d20';
+    }
+  }
+
+  /** For a Without Number save, the number the d20 must reach, when the sheet has one. */
+  private withoutNumberSaveTarget(rollTarget: string, character?: Actor): number | undefined {
+    const systemId = String((game as any).system?.id ?? '');
+    if (!character || (systemId !== 'swnr' && systemId !== 'wwn')) return undefined;
+    const system = (character as any).system ?? {};
+    const key = rollTarget.toLowerCase().trim();
+    const target =
+      systemId === 'swnr'
+        ? typeof system.save === 'object'
+          ? system.save?.[key]
+          : system.saves
+        : system.saves?.[key]?.value;
+    return typeof target === 'number' && target > 0 ? target : undefined;
   }
 
   /**
@@ -6868,8 +7031,12 @@ export class FoundryDataAccess {
     switch (rollType) {
       case 'ability':
         return `${rollTarget.toUpperCase()} Ability Check (${visibility})`;
-      case 'skill':
-        return `${rollTarget.charAt(0).toUpperCase() + rollTarget.slice(1)} Skill Check (${visibility})`;
+      case 'skill': {
+        // "pilot/int" reads as "Pilot (INT)".
+        const [skill = '', attribute = ''] = rollTarget.split(/[\/+,]/).map(p => p.trim());
+        const name = skill.charAt(0).toUpperCase() + skill.slice(1);
+        return `${name}${attribute ? ` (${attribute.toUpperCase()})` : ''} Skill Check (${visibility})`;
+      }
       case 'save':
         return `${rollTarget.toUpperCase()} Saving Throw (${visibility})`;
       case 'attack':
@@ -7021,7 +7188,12 @@ export class FoundryDataAccess {
 
         const messageData: any = {
           speaker: ChatMessage.getSpeaker({ actor: character }),
-          flavor: `${rollLabel} ${isGmRoll ? '(GM Override)' : ''}`,
+          // A label ending "needs 13+" carries the target; say how the roll came out.
+          flavor: `${rollLabel} ${isGmRoll ? '(GM Override)' : ''}${(() => {
+            const need = /needs (\d+)\+/.exec(String(rollLabel));
+            if (!need) return '';
+            return (roll.total ?? 0) >= Number(need[1]) ? ' — Success' : ' — Failure';
+          })()}`,
           ...(whisperTargets.length > 0 ? { whisper: whisperTargets } : {}),
         };
 
@@ -8114,13 +8286,66 @@ export class FoundryDataAccess {
   }
 
   /**
+   * Recent chat-log messages, oldest first, as plain text with any dice results.
+   * This is how a caller learns what a requested roll came to.
+   */
+  listChatMessages(data: { limit?: number; rollsOnly?: boolean; speaker?: string }): any {
+    this.validateFoundryState();
+    const limit = Math.min(Math.max(Number(data.limit) || 20, 1), 100);
+    const wanted = data.speaker?.toLowerCase().trim();
+    const userName = (id: string): string => (game.users as any)?.get(id)?.name ?? id;
+    const plain = (html: string): string => {
+      const text = String(html ?? '')
+        .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/&nbsp;/g, ' ')
+        .replace(/&amp;/g, '&')
+        .replace(/\s+/g, ' ')
+        .trim();
+      return text.length > 400 ? text.slice(0, 400) + '…' : text;
+    };
+
+    let messages: any[] = Array.from((game.messages as any)?.contents ?? []);
+    if (data.rollsOnly) messages = messages.filter(m => (m.rolls?.length ?? 0) > 0);
+    if (wanted) {
+      messages = messages.filter(m =>
+        [m.speaker?.alias, m.author?.name].some(n => n?.toLowerCase().includes(wanted))
+      );
+    }
+    const total = messages.length;
+
+    return {
+      success: true,
+      total,
+      messages: messages.slice(-limit).map(m => {
+        const rolls = (m.rolls ?? []).map((r: any) => ({
+          formula: r.formula,
+          total: r.total,
+          dice: (r.dice ?? []).flatMap((d: any) => (d.results ?? []).map((x: any) => x.result)),
+        }));
+        return {
+          id: m.id,
+          time: new Date(m.timestamp).toISOString(),
+          author: m.author?.name,
+          speaker: m.speaker?.alias || m.author?.name,
+          ...(m.whisper?.length ? { whisperedTo: m.whisper.map(userName) } : {}),
+          ...(m.flavor ? { flavor: plain(m.flavor) } : {}),
+          ...(rolls.length ? { rolls } : {}),
+          text: rolls.length ? '' : plain(m.content),
+        };
+      }),
+    };
+  }
+
+  /**
    * Get friendly NPCs from current scene
    */
   async getFriendlyNPCs(): Promise<Array<{ id: string; name: string }>> {
     this.validateFoundryState();
 
     try {
-      const scene = game.scenes?.find(s => s.active);
+      // Same scene the other token tools use: the one the Gamemaster is viewing.
+      const scene = (game.scenes as any)?.current ?? game.scenes?.find(s => s.active);
       if (!scene) {
         return [];
       }
@@ -8134,7 +8359,7 @@ export class FoundryDataAccess {
           id: token.actor?.id || token.id || '',
           name: token.name || token.actor?.name || 'Unknown',
         }))
-        .filter(t => t.id);
+        .filter((t: { id: string; name: string }) => t.id);
     } catch (error) {
       console.error(`[${MODULE_ID}] Error getting friendly NPCs:`, error);
       return [];

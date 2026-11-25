@@ -19,6 +19,27 @@ export class ChatTools {
   getToolDefinitions() {
     return [
       {
+        name: 'list-chat-messages',
+        description:
+          'Read recent messages from the Foundry chat log, oldest first: who spoke, the text, ' +
+          'whisper recipients, and dice results (formula, total, each die). Use this after ' +
+          'request-player-rolls to see what the player rolled, or to catch up on table chat.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            limit: {
+              type: 'number',
+              description: 'How many of the latest messages (default 20, max 100)',
+            },
+            rollsOnly: { type: 'boolean', description: 'Only messages that contain dice rolls' },
+            speaker: {
+              type: 'string',
+              description: 'Only messages whose speaker or author name contains this text',
+            },
+          },
+        },
+      },
+      {
         name: 'create-chat-message',
         description:
           'Speak an in-character line as an actor or a specific token: a floating speech ' +
@@ -80,6 +101,23 @@ export class ChatTools {
         },
       },
     ];
+  }
+
+  async handleListChatMessages(args: any): Promise<any> {
+    const parsed = z
+      .object({
+        limit: z.number().int().min(1).max(100).optional(),
+        rollsOnly: z.boolean().optional(),
+        speaker: z.string().optional(),
+      })
+      .parse(args ?? {});
+    try {
+      return await this.foundryClient.query('foundry-mcp-bridge.listChatMessages', parsed);
+    } catch (error) {
+      throw new Error(
+        `Failed to list chat messages: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
   }
 
   async handleCreateChatMessage(args: any): Promise<any> {

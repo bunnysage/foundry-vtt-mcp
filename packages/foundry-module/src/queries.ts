@@ -97,6 +97,7 @@ export class QueryHandlers {
 
     // In-character chat: bubbles, chat-log lines and whispers
     CONFIG.queries[`${modulePrefix}.createChatMessage`] = this.handleCreateChatMessage.bind(this);
+    CONFIG.queries[`${modulePrefix}.listChatMessages`] = this.handleListChatMessages.bind(this);
 
     // WFRP4e actor stat-block update
     CONFIG.queries[`${modulePrefix}.updateWfrp4eActor`] = this.handleUpdateWfrp4eActor.bind(this);
@@ -800,9 +801,15 @@ export class QueryHandlers {
 
       this.dataAccess.validateFoundryState();
 
-      if (!data.rollType || !data.rollTarget || !data.targetPlayer) {
+      // Initiative has nothing to name, so only it may leave rollTarget empty.
+      if (
+        !data.rollType ||
+        !data.targetPlayer ||
+        (!data.rollTarget && data.rollType !== 'initiative')
+      ) {
         throw new Error('rollType, rollTarget, and targetPlayer are required');
       }
+      data.rollTarget = data.rollTarget ?? '';
 
       return await this.dataAccess.requestPlayerRolls(data);
     } catch (error) {
@@ -964,6 +971,24 @@ export class QueryHandlers {
     } catch (error) {
       throw new Error(
         `Failed to get actor ownership: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
+  }
+
+  async handleListChatMessages(data: any): Promise<any> {
+    try {
+      // SECURITY: Silent GM validation
+      const gmCheck = this.validateGMAccess();
+      if (!gmCheck.allowed) {
+        return { error: 'Access denied', success: false };
+      }
+
+      this.dataAccess.validateFoundryState();
+
+      return this.dataAccess.listChatMessages(data ?? {});
+    } catch (error) {
+      throw new Error(
+        `Failed to list chat messages: ${error instanceof Error ? error.message : 'Unknown error'}`
       );
     }
   }

@@ -24,7 +24,7 @@ export class SceneTools {
       {
         name: 'get-current-scene',
         description:
-          'Get information about the currently active scene, including tokens, layout, and the music binding (playlist + playlistSound)',
+          'Get information about the scene the Gamemaster is currently viewing (normally the active scene), including tokens, layout, and the music binding (playlist + playlistSound). Token tools act on this scene. If players are on a different active scene, the result says so in activeScene.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -152,6 +152,10 @@ export class SceneTools {
       id: sceneData.id,
       name: sceneData.name,
       active: sceneData.active,
+      viewedByGM: true,
+      ...(sceneData.activeScene
+        ? { activeScene: sceneData.activeScene, note: sceneData.note }
+        : {}),
       dimensions: {
         width: sceneData.width,
         height: sceneData.height,

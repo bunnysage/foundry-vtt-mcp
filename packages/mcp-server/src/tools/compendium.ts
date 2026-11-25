@@ -937,6 +937,21 @@ export class CompendiumTools {
       summary: this.createItemSummary(item),
     };
 
+    // Stats attached by the Foundry module from its saved creature index.
+    if (item.stats && Object.keys(item.stats).length > 0) {
+      formatted.stats = item.stats;
+      const s = item.stats;
+      const bits = [
+        s.hitDice !== undefined ? `HD ${s.hitDice}` : '',
+        s.challengeRating !== undefined ? `CR ${s.challengeRating}` : '',
+        s.level !== undefined ? `Level ${s.level}` : '',
+        s.hitPoints !== undefined ? `HP ${s.hitPoints}` : '',
+        s.armorClass !== undefined ? `AC ${s.armorClass}` : '',
+      ].filter(Boolean);
+      if (bits.length) formatted.summary = `${bits.join(', ')} — ${formatted.summary}`;
+      return formatted;
+    }
+
     // Add key stats for actors/creatures to reduce need for detail calls.
     // `adversary` is Cosmere RPG's NPC equivalent.
     // `monster` is Worlds Without Number's NPC type.

@@ -1665,6 +1665,11 @@ async function startBackend(): Promise<void> {
 
                 // Chat tools
 
+                case 'list-chat-messages':
+                  result = await chatTools.handleListChatMessages(args);
+
+                  break;
+
                 case 'create-chat-message':
                   result = await chatTools.handleCreateChatMessage(args);
 
