@@ -11,7 +11,16 @@ import { z } from 'zod';
  * Supported game system identifiers
  * Extend this type when adding new systems
  */
-export type SystemId = 'dnd5e' | 'pf2e' | 'dsa5' | 'cosmere-rpg' | 'wfrp4e' | 'mgt2e' | 'other';
+export type SystemId =
+  | 'dnd5e'
+  | 'pf2e'
+  | 'dsa5'
+  | 'cosmere-rpg'
+  | 'wfrp4e'
+  | 'mgt2e'
+  | 'swnr'
+  | 'wwn'
+  | 'other';
 
 /**
  * System metadata returned by adapters
@@ -339,6 +348,48 @@ export interface MGT2eCreatureIndex extends SystemCreatureIndex {
 }
 
 /**
+ * Stars Without Number Revised specific creature index structure
+ */
+export interface SWNRCreatureIndex extends SystemCreatureIndex {
+  system: 'swnr';
+  systemData: {
+    /** Hit Dice (e.g. 3, 5, 10 — primary power-level indicator for creatures) */
+    hitDice?: number;
+    /** Hit Points */
+    hitPoints?: number;
+    /** Armor Class */
+    armorClass?: number;
+    /** Attributes (STR, DEX, CON, INT, WIS, CHA with modifiers) */
+    attributes?: Record<string, { value: number; mod: number }>;
+    /** True if the creature has psionic powers */
+    hasPsionics?: boolean;
+    /** Creature tags/traits */
+    tags?: string[];
+  };
+}
+
+/**
+ * Worlds Without Number specific creature index structure
+ */
+export interface WWNCreatureIndex extends SystemCreatureIndex {
+  system: 'wwn';
+  systemData: {
+    /** Hit Dice (e.g. 3, 5, 10 — primary power-level indicator for creatures) */
+    hitDice?: number;
+    /** Hit Points */
+    hitPoints?: number;
+    /** Armor Class */
+    armorClass?: number;
+    /** Attributes (STR, DEX, CON, INT, WIS, CHA with modifiers) */
+    attributes?: Record<string, { value: number; mod: number }>;
+    /** True if the creature has magic (arts/spells) */
+    hasMagic?: boolean;
+    /** Creature tags/traits */
+    tags?: string[];
+  };
+}
+
+/**
  * Generic creature index for unsupported systems
  */
 export interface GenericCreatureIndex extends SystemCreatureIndex {
@@ -356,4 +407,6 @@ export type AnyCreatureIndex =
   | CosmereRpgCreatureIndex
   | WFRP4eCreatureIndex
   | MGT2eCreatureIndex
+  | SWNRCreatureIndex
+  | WWNCreatureIndex
   | GenericCreatureIndex;
